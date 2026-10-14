@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -35,6 +36,10 @@
   },
   "plugins": {
     "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ4RTkzMzM2Mzk0MEMwRTUKUldUbHdFQTVOalBwMkQxajM4UENNQVlzazBLaWxWTE5KUzdYYVVnc3pSRHArMGEzcTZIT0NCSEgK",
+      "endpoints": [
+        "https://github.com/240011814/desktools/releases/latest/download/latest.json"
+      ],
       "requireSignedVersion": true
     }
   }

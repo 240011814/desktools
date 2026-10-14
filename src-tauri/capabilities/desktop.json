@@ -10,6 +10,7 @@
   ],
   "permissions": [
     "opener:default",
+    "process:default",
     "autostart:default",
     "clipboard-manager:default",
     "updater:default"

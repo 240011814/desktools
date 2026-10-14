@@ -3,16 +3,19 @@ import { onMounted, ref } from "vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 const RELEASES_URL = "https://github.com/240011814/desktools/releases/latest";
-const RELEASES_API =
-  "https://api.github.com/repos/240011814/desktools/releases/latest";
 
 const version = ref("...");
 const autoStart = ref(false);
 const checking = ref(false);
+const installing = ref(false);
+const progress = ref(0);
 const status = ref<"idle" | "latest" | "update" | "error">("idle");
-const latestVersion = ref("");
+const update = ref<Update | null>(null);
+const errorMsg = ref("");
 
 onMounted(async () => {
   try {
@@ -28,38 +31,50 @@ onMounted(async () => {
   checkUpdate();
 });
 
-/** 解析 "1.0.12+b497821" / "v1.0.12-b497821" → [1, 0, 12] */
-function parseVersion(v: string): number[] {
-  const core = v.replace(/^v/i, "").split(/[-+]/)[0];
-  return core.split(".").map((n) => parseInt(n, 10) || 0);
-}
-
-function isNewer(candidate: string, current: string): boolean {
-  const a = parseVersion(candidate);
-  const b = parseVersion(current);
-  for (let i = 0; i < 3; i++) {
-    if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
-  }
-  return false;
-}
-
 async function checkUpdate() {
   checking.value = true;
   status.value = "idle";
+  errorMsg.value = "";
   try {
-    const res = await fetch(RELEASES_API, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    latestVersion.value = data.tag_name ?? "";
-    status.value = isNewer(latestVersion.value, version.value)
-      ? "update"
-      : "latest";
-  } catch {
+    const found = await check();
+    update.value = found ?? null;
+    status.value = found ? "update" : "latest";
+  } catch (e) {
     status.value = "error";
+    errorMsg.value = String(e);
   } finally {
     checking.value = false;
+  }
+}
+
+async function installUpdate() {
+  if (!update.value || installing.value) return;
+  installing.value = true;
+  progress.value = 0;
+  try {
+    let downloaded = 0;
+    let contentLength = 0;
+    await update.value.downloadAndInstall((event) => {
+      switch (event.event) {
+        case "Started":
+          contentLength = event.data.contentLength ?? 0;
+          break;
+        case "Progress":
+          downloaded += event.data.chunkLength;
+          if (contentLength > 0) {
+            progress.value = Math.round((downloaded / contentLength) * 100);
+          }
+          break;
+        case "Finished":
+          progress.value = 100;
+          break;
+      }
+    });
+    await relaunch();
+  } catch (e) {
+    status.value = "error";
+    errorMsg.value = String(e);
+    installing.value = false;
   }
 }
 
@@ -88,19 +103,30 @@ function openReleases() {
       <h2>版本</h2>
       <p class="version">{{ version }}</p>
       <div class="row">
-        <button :disabled="checking" @click="checkUpdate">
+        <button :disabled="checking || installing" @click="checkUpdate">
           {{ checking ? "检测中…" : "检测新版本" }}
         </button>
+        <button
+          v-if="status === 'update'"
+          class="primary"
+          :disabled="installing"
+          @click="installUpdate"
+        >
+          {{ installing ? `下载中 ${progress}%` : "下载并安装" }}
+        </button>
+      </div>
+      <div v-if="installing" class="progress">
+        <div class="bar" :style="{ width: progress + '%' }"></div>
       </div>
       <p v-if="status === 'latest'" class="hint ok">
         当前已是最新版本
       </p>
-      <p v-else-if="status === 'update'" class="hint warn">
-        发现新版本 {{ latestVersion }}
-        <button class="link" @click="openReleases">前往下载</button>
+      <p v-else-if="status === 'update' && !installing" class="hint warn">
+        发现新版本 {{ update?.version ?? "" }}，安装完成后将自动重启应用
+        <button class="link" @click="openReleases">手动下载</button>
       </p>
       <p v-else-if="status === 'error'" class="hint err">
-        版本检测失败，请检查网络后重试
+        版本检测失败{{ errorMsg ? `：${errorMsg}` : "" }}
       </p>
     </section>
 
@@ -189,5 +215,30 @@ button.link {
   text-decoration: underline;
   cursor: pointer;
   font-size: 1em;
+}
+
+button.primary {
+  background: #4b8bf5;
+  border: none;
+  color: #fff;
+}
+
+button.primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.progress {
+  margin-top: 0.8em;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  background: #4b8bf5;
+  transition: width 0.2s;
 }
 </style>

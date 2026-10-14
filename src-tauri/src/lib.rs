@@ -23,6 +23,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 托盘图标与菜单
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
