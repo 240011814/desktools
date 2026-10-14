@@ -1,0 +1,100 @@
+name: Release
+
+# gitflow 发布：release/* 合入 main 后打 tag（如 v0.1.0）推送即触发
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # macOS (Apple Silicon)
+          - platform: windows-latest # Windows (x64)
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tauri-action 需要完整历史生成 changelog
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Verify tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$TAG" != "$CONF_VERSION" ] || [ "$TAG" != "$PKG_VERSION" ] || [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::tag v$TAG 与 tauri.conf.json ($CONF_VERSION) / package.json ($PKG_VERSION) / Cargo.toml ($CARGO_VERSION) 版本不一致"
+            exit 1
+          fi
+
+      - name: Build and publish to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: desktools ${{ github.ref_name }}
+          releaseBody: |
+            ## desktools ${{ github.ref_name }}
+
+            自动构建产物：
+            - macOS: `.dmg`
+            - Windows: `.exe` (NSIS) / `.msi`
+
+            > macOS 产物未签名，首次打开需在「系统设置 → 隐私与安全性」中允许。
+          releaseDraft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: --verbose
+
+      - name: Build (manual dispatch)
+        if: github.ref_type != 'tag'
+        run: pnpm tauri build
+
+      - name: Upload bundles (manual dispatch)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktools-${{ matrix.platform }}-release-dryrun
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app.tar.gz
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+          if-no-files-found: error
+          retention-days: 14
