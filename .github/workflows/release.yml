@@ -90,7 +90,7 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          tauriScript: pnpm tauri build
+          tauriScript: pnpm tauri
           releaseBody: |
             自动构建，版本 `${{ steps.version.outputs.version }}`（commit `${{ github.sha }}`）
 
