@@ -1,20 +1,23 @@
 name: Release
 
-# gitflow 发布：release/* 合入 main 后打 tag（如 v0.1.0）推送即触发
-#   git tag v0.1.0 && git push origin v0.1.0
+# 每次推送到 main 都构建 Windows/macOS 并发布到 GitHub Releases（无需手动打 tag）
+# 版本号基于 git 提交自动生成：1.0.<提交数>+<短SHA>，发布 tag 为 v1.0.<提交数>-<短SHA>
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
   workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Release (${{ matrix.platform }})
+  build:
+    name: Build (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +30,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # tauri-action 需要完整历史生成 changelog
+          fetch-depth: 0 # 需要完整历史统计提交数
+
+      - name: Compute version from git commit
+        id: version
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          VERSION="1.0.${COUNT}+${SHORT_SHA}"
+          export VERSION
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "App version: $VERSION"
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p, 'utf8'));
+            c.version = process.env.VERSION;
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+          "
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -49,52 +70,67 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
-      - name: Verify tag matches package version
-        if: github.ref_type == 'tag'
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
-          if [ "$TAG" != "$CONF_VERSION" ] || [ "$TAG" != "$PKG_VERSION" ] || [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "::error::tag v$TAG 与 tauri.conf.json ($CONF_VERSION) / package.json ($PKG_VERSION) / Cargo.toml ($CARGO_VERSION) 版本不一致"
-            exit 1
-          fi
-
-      - name: Build and publish to GitHub Release
-        if: github.ref_type == 'tag'
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: desktools ${{ github.ref_name }}
-          releaseBody: |
-            ## desktools ${{ github.ref_name }}
-
-            自动构建产物：
-            - macOS: `.dmg`
-            - Windows: `.exe` (NSIS) / `.msi`
-
-            > macOS 产物未签名，首次打开需在「系统设置 → 隐私与安全性」中允许。
-          releaseDraft: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          args: --verbose
-
-      - name: Build (manual dispatch)
-        if: github.ref_type != 'tag'
+      - name: Build Tauri app
         run: pnpm tauri build
 
-      - name: Upload bundles (manual dispatch)
-        if: github.ref_type != 'tag'
+      - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
-          name: desktools-${{ matrix.platform }}-release-dryrun
+          name: desktools-${{ matrix.platform }}
           path: |
             src-tauri/target/release/bundle/**/*.dmg
             src-tauri/target/release/bundle/**/*.app.tar.gz
             src-tauri/target/release/bundle/**/*.msi
             src-tauri/target/release/bundle/**/*.exe
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version from git commit
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          COUNT=$(git rev-list --count HEAD)
+          echo "version=1.0.${COUNT}+${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=v1.0.${COUNT}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Download bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktools-*
+          path: bundles
+          merge-multiple: true
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: desktools ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            自动构建，版本 `${{ steps.version.outputs.version }}`（commit `${{ github.sha }}`）
+
+            - macOS：`.dmg`
+            - Windows：`.exe`（NSIS）/ `.msi`
+
+            > macOS 产物未签名，首次打开需在「系统设置 → 隐私与安全性」中允许。
+          files: |
+            bundles/**/*.dmg
+            bundles/**/*.app.tar.gz
+            bundles/**/*.msi
+            bundles/**/*.exe
+          fail_on_unmatched_files: true

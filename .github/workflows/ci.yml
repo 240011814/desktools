@@ -1,10 +1,10 @@
 name: CI
 
-# gitflow 分支构建：develop / main / release/* / hotfix/* / feature/* 以及 PR
+# gitflow 分支构建：develop / release/* / hotfix/* / feature/* 以及 PR
+# main 的推送由 release.yml 负责，每次推送都会构建并发布到 GitHub Releases
 on:
   push:
     branches:
-      - main
       - develop
       - "release/**"
       - "hotfix/**"

@@ -1,6 +1,36 @@
-# Tauri + Vue + TypeScript
+# desktools
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+基于 Tauri 2 + Vue 3 + TypeScript 的桌面工具箱（Windows / macOS）。
+
+## 功能
+
+- **版本检测**：版本号由 git 提交自动生成（`1.0.<提交数>+<短SHA>`），启动时自动检查 GitHub Releases 是否有新版本，可手动检测并跳转下载页。
+- **开机自动启动**：默认随系统登录自启动（带 `--hidden` 参数，仅驻留托盘不弹窗），可在应用内关闭/开启。
+- **最小化到托盘**：关闭窗口不退出程序，最小化到系统托盘；托盘菜单可「显示主窗口」或「退出」。
+
+## 开发
+
+```bash
+pnpm install
+pnpm tauri dev
+```
+
+## 构建
+
+```bash
+pnpm tauri build
+```
+
+产物位于 `src-tauri/target/release/bundle/`（macOS：`.dmg`；Windows：`.exe` NSIS / `.msi`）。
+
+## CI / 发布
+
+- `.github/workflows/ci.yml`：`develop` / `release/**` / `hotfix/**` / `feature/**` 分支及 PR 推送时构建验证（macOS + Windows）。
+- `.github/workflows/release.yml`：**每次推送到 `main`** 自动构建 macOS + Windows 并发布到 GitHub Releases，无需手动打 tag：
+  - 版本号：`1.0.<git 提交数>+<短SHA>`（写入应用配置）
+  - Release tag：`v1.0.<提交数>-<短SHA>`
+
+> macOS 产物未签名/公证，用户首次打开需在「系统设置 → 隐私与安全性」中允许。
 
 ## Recommended IDE Setup
 

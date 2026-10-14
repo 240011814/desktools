@@ -9,6 +9,7 @@
     "main"
   ],
   "permissions": [
+    "opener:default",
     "autostart:default",
     "clipboard-manager:default",
     "updater:default"
