@@ -15,6 +15,7 @@ const confirmClear = ref(false);
 let toastTimer: number | undefined;
 let confirmTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
+let unlistenRefresh: UnlistenFn | undefined;
 
 async function load() {
   try {
@@ -83,6 +84,8 @@ onMounted(async () => {
   await load();
   try {
     unlisten = await listen("history://changed", () => load());
+    // 打开 / 聚焦剪贴板历史窗口时后端触发一次刷新
+    unlistenRefresh = await listen("history://refresh", () => load());
   } catch {
     /* ignore */
   }
@@ -90,6 +93,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlisten?.();
+  unlistenRefresh?.();
   clearTimeout(toastTimer);
   clearTimeout(confirmTimer);
 });

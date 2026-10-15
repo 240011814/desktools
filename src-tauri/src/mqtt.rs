@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,9 +8,10 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::clipboard;
 use crate::config::MqttConfig;
 use crate::history::{now_ms, HistoryState};
-use crate::logger::{self, INFO, WARN};
+use crate::logger::{self, ERROR, INFO, WARN};
 
 /// 前端监听的连接状态事件
 pub const STATUS_EVENT: &str = "mqtt://status";
@@ -33,6 +36,15 @@ pub struct SyncMessage {
     pub ts: i64,
 }
 
+/// 收到消息的内存队列容量（超出后丢弃并记 WARN，避免慢消费拖垮 MQTT 事件循环）
+const INCOMING_QUEUE_CAPACITY: usize = 512;
+/// 本机发布内容的回流识别：只保留最近若干条、数十秒内有效。
+/// 回流链路 = 本机发布 → 对端收到（网络延迟）→ 对端监听线程周期（≤700ms）→ 回发 → 本机收到，
+/// 带宽紧张时可到数秒，故窗口取 10s。副作用：10s 内跨设备重复复制同一文本会被当作回流忽略，
+/// 但内容相同，只是这一次同步不落剪贴板，可接受。
+const RECENT_SENT_CAP: usize = 16;
+const RECENT_ECHO_WINDOW_MS: i64 = 10_000;
+
 /// 全局同步状态
 pub struct SyncState {
     pub config: Mutex<MqttConfig>,
@@ -42,10 +54,20 @@ pub struct SyncState {
     run_id: AtomicU64,
     /// 最近一次已收/已发的剪贴板文本，用于去重、防回环
     last_clip: Arc<Mutex<String>>,
+    /// 剪贴板决策闸门：监听线程「读剪贴板 → 判定 → 发布 → 更新基准」与
+    /// 消息处理线程「更新基准 → 写剪贴板」互斥，杜绝过期快照被当新复制发布出去（回流）
+    clip_gate: Mutex<()>,
+    /// 最近发布出去的（文本, 时间），用于识别对端回流回来的本机内容
+    recent_sent: Mutex<VecDeque<(String, i64)>>,
+    /// 收到的 MQTT 消息入队，由后台单线程顺序处理
+    incoming_tx: SyncSender<String>,
+    /// 仅允许取一次：消费线程启动时取走 Receiver
+    incoming_rx: Mutex<Option<Receiver<String>>>,
 }
 
 impl SyncState {
     pub fn new(config: MqttConfig) -> Self {
+        let (incoming_tx, incoming_rx) = sync_channel(INCOMING_QUEUE_CAPACITY);
         Self {
             config: Mutex::new(config),
             status: Mutex::new(MqttStatus {
@@ -56,11 +78,65 @@ impl SyncState {
             client: Mutex::new(None),
             run_id: AtomicU64::new(0),
             last_clip: Arc::new(Mutex::new(String::new())),
+            clip_gate: Mutex::new(()),
+            recent_sent: Mutex::new(VecDeque::new()),
+            incoming_tx,
+            incoming_rx: Mutex::new(Some(incoming_rx)),
         }
     }
 
     pub fn client(&self) -> Option<AsyncClient> {
         self.client.lock().unwrap().clone()
+    }
+
+    /// 更新防回环基准：最近一次已收/已发/手动复制的剪贴板文本
+    pub fn set_last_clip(&self, text: &str) {
+        *self.last_clip.lock().unwrap() = text.to_string();
+    }
+
+    /// 串行化剪贴板相关决策（见 `clip_gate` 字段说明）。
+    /// 约定：所有调用方都是先拿闸门、再拿内部锁，闭包内取其它锁不会死锁。
+    pub fn with_clip_gate<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.clip_gate.lock().unwrap();
+        f()
+    }
+
+    /// 记录一条已发布内容（识别回流用）
+    pub fn mark_sent(&self, text: &str) {
+        self.mark_sent_at(text, now_ms());
+    }
+
+    fn mark_sent_at(&self, text: &str, ts: i64) {
+        let mut recent = self.recent_sent.lock().unwrap();
+        recent.push_back((text.to_string(), ts));
+        while recent.len() > RECENT_SENT_CAP {
+            recent.pop_front();
+        }
+    }
+
+    /// 是否是本机最近发布内容的回流（对端防回环失效时会把自己的内容原样发回来）
+    pub fn is_recent_echo(&self, text: &str) -> bool {
+        self.is_recent_echo_at(text, now_ms())
+    }
+
+    fn is_recent_echo_at(&self, text: &str, now: i64) -> bool {
+        self.recent_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(sent, ts)| sent == text && now - *ts <= RECENT_ECHO_WINDOW_MS)
+    }
+
+    /// 收到的 MQTT 消息入队（队列满时丢弃，由调用方记日志）
+    pub fn enqueue_incoming(&self, raw: String) -> Result<(), String> {
+        self.incoming_tx
+            .try_send(raw)
+            .map_err(|e| format!("消息入队失败：{e}"))
+    }
+
+    /// 取走队列接收端（幂等，仅首次成功）
+    pub fn take_incoming_receiver(&self) -> Option<Receiver<String>> {
+        self.incoming_rx.lock().unwrap().take()
     }
 }
 
@@ -157,33 +233,72 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
     });
 }
 
-/// 处理收到的消息：非本机发出的内容写入剪贴板
+/// 收到消息：仅入队，处理交给后台单线程（不在 MQTT 事件循环里做剪贴板/历史 IO）
 fn handle_incoming(app: &AppHandle, payload: &[u8]) {
     let raw = String::from_utf8_lossy(payload).to_string();
-    let Some(text) = parse_payload(&raw, &current_device_id(app)) else {
+    if let Err(err) = app.state::<SyncState>().enqueue_incoming(raw) {
+        logger::log(app, WARN, format!("{err}，消息已丢弃"));
+    }
+}
+
+/// 启动后台消息处理线程：单线程顺序消费队列（解析 → 记历史 → 写剪贴板）
+pub fn spawn_message_worker(app: AppHandle) {
+    let Some(rx) = app.state::<SyncState>().take_incoming_receiver() else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("mqtt-message-worker".into())
+        .spawn(move || {
+            while let Ok(raw) = rx.recv() {
+                process_incoming(&app, &raw);
+            }
+        });
+}
+
+/// 处理一条消息：非本机发出的内容写入剪贴板
+fn process_incoming(app: &AppHandle, raw: &str) {
+    let Some(text) = parse_payload(raw, &current_device_id(app)) else {
         return;
     };
 
-    // 先记录再写剪贴板，避免监听线程把它当成新的复制内容又发出去
-    *app.state::<SyncState>().last_clip.lock().unwrap() = text.clone();
-    // 远端内容同样进入历史记录
-    app.state::<HistoryState>().push(app, &text, "remote");
-    logger::log(
-        app,
-        INFO,
-        format!(
-            "收到远端内容，已写入剪贴板（{} 字符）：{}",
-            text.chars().count(),
-            logger::preview(&text)
-        ),
-    );
-    #[cfg(desktop)]
-    {
-        use tauri_plugin_clipboard_manager::ClipboardExt;
-        let _ = app.clipboard().write_text(text);
+    let sync = app.state::<SyncState>();
+    // 对端防回环失效时，本机发布的内容会被原样回流回来；
+    // 若不拦截，回流的旧内容会在几百毫秒后覆盖本机刚同步到的新内容
+    if sync.is_recent_echo(&text) {
+        logger::log(
+            app,
+            INFO,
+            format!(
+                "忽略回流的本机内容（{} 字符）：{}",
+                text.chars().count(),
+                logger::preview(&text)
+            ),
+        );
+        return;
     }
-    #[cfg(not(desktop))]
-    let _ = text;
+
+    sync.with_clip_gate(|| {
+        // 先记录再写剪贴板，避免监听线程把它当成新的复制内容又发出去
+        sync.set_last_clip(&text);
+        // 远端内容同样进入历史记录
+        app.state::<HistoryState>().push(app, &text, "remote");
+        // 写剪贴板（读回校验 + 竞争重试），结果如实记日志
+        let chars = text.chars().count();
+        let preview = logger::preview(&text);
+        match clipboard::write_text_verified(app, &text) {
+            Ok(1) => logger::log(app, INFO, format!("收到远端内容，已写入剪贴板（{chars} 字符）：{preview}")),
+            Ok(attempts) => logger::log(
+                app,
+                WARN,
+                format!("收到远端内容，写入剪贴板时发生竞争，第 {attempts} 次尝试成功（{chars} 字符）：{preview}"),
+            ),
+            Err(err) => logger::log(
+                app,
+                ERROR,
+                format!("收到远端内容，但写入剪贴板失败（{chars} 字符）：{preview}，原因：{err}"),
+            ),
+        }
+    });
 }
 
 /// 解析消息内容，返回需要写入剪贴板的文本。
@@ -224,48 +339,55 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
             *last_clip.lock().unwrap() = last_seen.clone();
             loop {
                 std::thread::sleep(Duration::from_millis(700));
-                let text = match app.clipboard().read_text() {
-                    Ok(text) => text,
-                    Err(_) => continue, // 剪贴板里不是文本，忽略
-                };
-                if text.trim().is_empty() {
-                    continue;
-                }
-                if text != last_seen {
-                    last_seen = text.clone();
-                    // 与最近收/发内容一致说明是远端写入的，收到时已记录过
-                    if *last_clip.lock().unwrap() != text {
-                        app.state::<HistoryState>().push(&app, &text, "local");
+                // 整段决策放在剪贴板闸门内：与消息处理线程的「更新基准 → 写剪贴板」互斥，
+                // 防止读到的过期快照被当成新复制发布出去（回流的旧内容会覆盖对端刚同步的新内容）
+                app.state::<SyncState>().with_clip_gate(|| {
+                    let text = match app.clipboard().read_text() {
+                        Ok(text) => text,
+                        Err(_) => return, // 剪贴板里不是文本，忽略
+                    };
+                    if text.trim().is_empty() {
+                        return;
                     }
-                }
-                // 已发过/已收过的内容不重复发送；未连接时不更新基准，重连后自动补发
-                if *last_clip.lock().unwrap() == text {
-                    continue;
-                }
-                let Some(client) = app.state::<SyncState>().client() else {
-                    continue;
-                };
-                let cfg = app.state::<SyncState>().config.lock().unwrap().clone();
-                let preview = logger::preview(&text);
-                let payload = serde_json::json!({
-                    "deviceId": cfg.device_id,
-                    "text": text,
-                    "ts": now_ms(),
-                })
-                .to_string();
-                let topic = cfg.topic();
-                tauri::async_runtime::spawn(async move {
-                    let _ = client.publish(topic, QoS::AtLeastOnce, false, payload).await;
+                    let sync = app.state::<SyncState>();
+                    if text != last_seen {
+                        last_seen = text.clone();
+                        // 与最近收/发内容一致说明是远端写入的，收到时已记录过
+                        if *last_clip.lock().unwrap() != text {
+                            app.state::<HistoryState>().push(&app, &text, "local");
+                        }
+                    }
+                    // 已发过/已收过的内容不重复发送；未连接时不更新基准，重连后自动补发
+                    if *last_clip.lock().unwrap() == text {
+                        return;
+                    }
+                    let Some(client) = sync.client() else {
+                        return;
+                    };
+                    let cfg = sync.config.lock().unwrap().clone();
+                    let preview = logger::preview(&text);
+                    let payload = serde_json::json!({
+                        "deviceId": cfg.device_id,
+                        "text": text,
+                        "ts": now_ms(),
+                    })
+                    .to_string();
+                    let topic = cfg.topic();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = client.publish(topic, QoS::AtLeastOnce, false, payload).await;
+                    });
+                    logger::log(
+                        &app,
+                        INFO,
+                        format!(
+                            "已发送同步内容（{} 字符）：{preview}",
+                            text.chars().count()
+                        ),
+                    );
+                    *last_clip.lock().unwrap() = text.clone();
+                    // 记录已发布内容：对端把它原样回流回来时直接忽略
+                    sync.mark_sent(&text);
                 });
-                logger::log(
-                    &app,
-                    INFO,
-                    format!(
-                        "已发送同步内容（{} 字符）：{preview}",
-                        text.chars().count()
-                    ),
-                );
-                *last_clip.lock().unwrap() = text;
             }
         });
 }
@@ -273,6 +395,42 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queues_incoming_messages_in_order() {
+        let sync = SyncState::new(MqttConfig::default());
+        sync.enqueue_incoming("first".into()).unwrap();
+        sync.enqueue_incoming("second".into()).unwrap();
+        let rx = sync.take_incoming_receiver().unwrap();
+        assert_eq!(rx.recv().unwrap(), "first");
+        assert_eq!(rx.recv().unwrap(), "second");
+        // 接收端只能取一次
+        assert!(sync.take_incoming_receiver().is_none());
+    }
+
+    #[test]
+    fn detects_recent_echo_of_sent_text() {
+        let sync = SyncState::new(MqttConfig::default());
+        sync.mark_sent_at("hello", 1_000);
+        assert!(sync.is_recent_echo_at("hello", 3_000));
+        // 超出回流识别窗口后不再拦截
+        assert!(!sync.is_recent_echo_at("hello", 1_000 + RECENT_ECHO_WINDOW_MS + 1));
+        // 没发过的内容不拦
+        assert!(!sync.is_recent_echo_at("other", 3_000));
+    }
+
+    #[test]
+    fn keeps_only_recent_sent_items() {
+        let sync = SyncState::new(MqttConfig::default());
+        let last = RECENT_SENT_CAP as i64 + 4;
+        for i in 0..=last {
+            sync.mark_sent_at(&format!("item-{i}"), i);
+        }
+        // 最早的已被淘汰
+        assert!(!sync.is_recent_echo_at("item-0", last));
+        // 最新的仍在
+        assert!(sync.is_recent_echo_at(&format!("item-{last}"), last));
+    }
 
     #[test]
     fn ignores_message_from_self() {

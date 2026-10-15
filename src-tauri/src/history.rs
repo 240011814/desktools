@@ -9,6 +9,8 @@ use crate::logger::{self, INFO};
 
 /// 前端监听的历史变更事件
 pub const HISTORY_EVENT: &str = "history://changed";
+/// 前端监听的刷新事件（打开 / 聚焦历史窗口时触发一次刷新）
+pub const HISTORY_REFRESH_EVENT: &str = "history://refresh";
 /// 最多保存的记录条数
 pub const HISTORY_LIMIT: usize = 200;
 

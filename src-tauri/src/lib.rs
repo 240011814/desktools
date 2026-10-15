@@ -1,8 +1,9 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, State, WindowEvent};
+use tauri::{Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 
+mod clipboard;
 mod config;
 mod history;
 mod logger;
@@ -29,6 +30,8 @@ fn show_history_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
         logger::log(app, logger::INFO, "已打开剪贴板历史窗口");
+        // 打开时让前端自动刷新一次（窗口已显示/已聚焦时 show 不触发窗口事件，这里兜底）
+        let _ = app.emit(history::HISTORY_REFRESH_EVENT, ());
     }
 }
 
@@ -81,13 +84,8 @@ fn clear_history(app: tauri::AppHandle) {
 fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
     #[cfg(desktop)]
     {
-        use tauri_plugin_clipboard_manager::ClipboardExt;
-        app.clipboard().write_text(text.clone()).map_err(|e| {
-            let msg = format!("写入剪贴板失败：{e}");
-            logger::log(&app, logger::ERROR, &msg);
-            msg
-        })?;
-        logger::log(&app, logger::INFO, format!("已复制到剪贴板（{} 字符）", text.chars().count()));
+        // 写入 + 读回校验 + 竞争重试，并记入防回环基准（监听线程不再重复发布/记录）
+        clipboard::copy(&app, &text)?;
         Ok(())
     }
     #[cfg(not(desktop))]
@@ -235,6 +233,9 @@ pub fn run() {
                 ),
             );
 
+            // 收到的 MQTT 消息进入内存队列，由后台单线程顺序处理（记历史、写剪贴板）
+            mqtt::spawn_message_worker(app.handle().clone());
+
             // 启动后自动连接 MQTT 并订阅 texthub/<group号>
             mqtt::start(app.handle().clone(), cfg);
 
@@ -258,6 +259,11 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+            }
+            // 历史窗口每次获得焦点时，通知前端自动刷新一次
+            //（show_history_window 在 show 后也会显式触发，覆盖已显示/已聚焦的场景）
+            if window.label() == "history" && matches!(event, WindowEvent::Focused(true)) {
+                let _ = window.emit(history::HISTORY_REFRESH_EVENT, ());
             }
         })
         .run(tauri::generate_context!())
