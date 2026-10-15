@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config::MqttConfig;
+use crate::history::{now_ms, HistoryState};
+use crate::logger::{self, INFO, WARN};
 
 /// 前端监听的连接状态事件
 pub const STATUS_EVENT: &str = "mqtt://status";
@@ -62,13 +64,6 @@ impl SyncState {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 pub fn set_status(app: &AppHandle, state: &str, message: impl Into<String>, topic: String) {
     let status = MqttStatus {
         state: state.into(),
@@ -91,9 +86,15 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
     let topic = cfg.topic();
     if cfg.host.trim().is_empty() || cfg.group.trim().is_empty() {
         set_status(&app, "idle", "请先填写服务器地址与 Group 号", topic);
+        logger::log(&app, WARN, "同步未启用：未填写服务器地址或 Group 号");
         return;
     }
     set_status(&app, "connecting", "正在连接…", topic.clone());
+    logger::log(
+        &app,
+        INFO,
+        format!("开始连接 MQTT {}:{}（订阅 {}）", cfg.host.trim(), cfg.port, topic),
+    );
 
     tauri::async_runtime::spawn(async move {
         let mut opts = MqttOptions::new(
@@ -127,6 +128,7 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                     // 连接成功后自动订阅
                     if let Some(client) = app.state::<SyncState>().client() {
                         let _ = client.subscribe(topic.clone(), QoS::AtLeastOnce).await;
+                        logger::log(&app, INFO, format!("MQTT 已连接，已订阅 {topic}"));
                     }
                     set_status(&app, "connected", "已连接", topic.clone());
                 }
@@ -141,6 +143,7 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                         format!("连接中断，正在重连：{err}"),
                         topic.clone(),
                     );
+                    logger::log(&app, WARN, format!("MQTT 连接中断，正在重连：{err}"));
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
@@ -163,6 +166,13 @@ fn handle_incoming(app: &AppHandle, payload: &[u8]) {
 
     // 先记录再写剪贴板，避免监听线程把它当成新的复制内容又发出去
     *app.state::<SyncState>().last_clip.lock().unwrap() = text.clone();
+    // 远端内容同样进入历史记录
+    app.state::<HistoryState>().push(app, &text, "remote");
+    logger::log(
+        app,
+        INFO,
+        format!("收到远端内容，已写入剪贴板（{} 字符）", text.chars().count()),
+    );
     #[cfg(desktop)]
     {
         use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -205,21 +215,31 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
         .name("clipboard-watcher".into())
         .spawn(move || {
             let last_clip = app.state::<SyncState>().last_clip.clone();
-            // 启动时的剪贴板内容作为基准，不对外发送
-            if let Ok(text) = app.clipboard().read_text() {
-                *last_clip.lock().unwrap() = text;
-            }
+            // 启动时的剪贴板内容作为基准：不记录、不对外发送
+            let mut last_seen = app.clipboard().read_text().unwrap_or_default();
+            *last_clip.lock().unwrap() = last_seen.clone();
             loop {
                 std::thread::sleep(Duration::from_millis(700));
                 let text = match app.clipboard().read_text() {
                     Ok(text) => text,
                     Err(_) => continue, // 剪贴板里不是文本，忽略
                 };
-                if text.is_empty() || *last_clip.lock().unwrap() == text {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if text != last_seen {
+                    last_seen = text.clone();
+                    // 与最近收/发内容一致说明是远端写入的，收到时已记录过
+                    if *last_clip.lock().unwrap() != text {
+                        app.state::<HistoryState>().push(&app, &text, "local");
+                    }
+                }
+                // 已发过/已收过的内容不重复发送；未连接时不更新基准，重连后自动补发
+                if *last_clip.lock().unwrap() == text {
                     continue;
                 }
                 let Some(client) = app.state::<SyncState>().client() else {
-                    continue; // 未连接时先不更新基准，重连后自动补发
+                    continue;
                 };
                 let cfg = app.state::<SyncState>().config.lock().unwrap().clone();
                 let payload = serde_json::json!({
@@ -232,6 +252,11 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                 tauri::async_runtime::spawn(async move {
                     let _ = client.publish(topic, QoS::AtLeastOnce, false, payload).await;
                 });
+                logger::log(
+                    &app,
+                    INFO,
+                    format!("已发送同步内容（{} 字符）", text.chars().count()),
+                );
                 *last_clip.lock().unwrap() = text;
             }
         });

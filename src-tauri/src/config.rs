@@ -96,6 +96,14 @@ pub fn config_path(app: &tauri::AppHandle) -> PathBuf {
         .join("config.json")
 }
 
+/// 剪贴板历史文件路径：<app_config_dir>/history.json
+pub fn history_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("history.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

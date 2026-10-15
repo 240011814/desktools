@@ -1,9 +1,10 @@
-/* 全局基础样式：浅色 / 深色自适应 */
+/* ============ 设计变量：浅色 / 深色自适应 ============ */
 :root {
   color-scheme: light dark;
   --bg: #f2f4f8;
   --bg-elevated: #ffffff;
   --bg-input: #ffffff;
+  --bg-hover: rgba(75, 123, 236, 0.08);
   --text: #1b1f27;
   --text-secondary: #5b6472;
   --text-muted: #8b94a3;
@@ -27,6 +28,7 @@
     --bg: #12151c;
     --bg-elevated: #1b1f29;
     --bg-input: #222734;
+    --bg-hover: rgba(108, 155, 255, 0.1);
     --text: #e8ebf1;
     --text-secondary: #a7b0bf;
     --text-muted: #737d8c;
@@ -52,6 +54,8 @@ html,
 body {
   margin: 0;
   padding: 0;
+  height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -64,13 +68,16 @@ body {
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   user-select: none;
-  overflow-x: hidden;
 }
 
 input,
 button,
 textarea {
   font: inherit;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 ::-webkit-scrollbar {
@@ -85,4 +92,356 @@ textarea {
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ============ 页面骨架 ============ */
+.page {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 26px 30px 40px;
+}
+
+.page-head {
+  margin-bottom: 18px;
+}
+
+.page-head h1 {
+  margin: 0;
+  font-size: 1.3rem;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+}
+
+.page-head p {
+  margin: 4px 0 0;
+  font-size: 0.84rem;
+  color: var(--text-muted);
+}
+
+/* ============ 卡片 ============ */
+.card {
+  margin-bottom: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+  text-align: left;
+}
+
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.card-head h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.card-sub {
+  margin: 2px 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* ============ 按钮 ============ */
+button {
+  padding: 8px 15px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.05s;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button.primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: #fff;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: transparent;
+  color: #fff;
+}
+
+button.danger {
+  border-color: transparent;
+  background: var(--err-soft);
+  color: var(--err);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--err);
+  border-color: transparent;
+  color: #fff;
+}
+
+button.ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+button.ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--accent);
+}
+
+button.link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+button.link:hover {
+  color: var(--accent-hover);
+  border: none;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* ============ 表单 ============ */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.field.span-2 {
+  grid-column: span 2;
+}
+
+.field > span {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.field input {
+  width: 100%;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  user-select: text;
+}
+
+.field input::placeholder {
+  color: var(--text-muted);
+}
+
+.field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+/* ============ 开关 ============ */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch .track {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(128, 138, 156, 0.35);
+  transition: background 0.18s;
+  flex-shrink: 0;
+}
+
+.switch .thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 0.18s;
+}
+
+.switch input:checked + .track {
+  background: var(--accent);
+}
+
+.switch input:checked + .track .thumb {
+  transform: translateX(16px);
+}
+
+.switch input:focus-visible + .track {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.switch-text {
+  font-size: 0.86rem;
+}
+
+/* ============ 状态徽章 ============ */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--accent-soft);
+  white-space: nowrap;
+}
+
+.status-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-pill.connected {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.status-pill.connecting,
+.status-pill.reconnecting {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.status-pill.error {
+  color: var(--err);
+  background: var(--err-soft);
+}
+
+.status-pill.connecting .dot,
+.status-pill.reconnecting .dot {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ============ 提示 / 空状态 / 进度 ============ */
+.hint {
+  margin: 12px 0 0;
+  font-size: 0.79rem;
+  color: var(--text-muted);
+  line-height: 1.65;
+}
+
+.hint.ok {
+  color: var(--ok);
+}
+
+.hint.warn {
+  color: var(--warn);
+}
+
+.hint.err {
+  color: var(--err);
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 46px 20px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.empty svg {
+  width: 38px;
+  height: 38px;
+  opacity: 0.45;
+}
+
+.empty p {
+  margin: 0;
+  font-size: 0.84rem;
+}
+
+.progress {
+  margin-top: 4px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
 }
