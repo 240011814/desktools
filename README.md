@@ -37,7 +37,15 @@ pnpm tauri build
   - 版本号：`1.0.<git 提交数>+<短SHA>`（写入应用配置）
   - Release tag：`v1.0.<提交数>-<短SHA>`
 
-> macOS 产物未签名/公证，用户首次打开需在「系统设置 → 隐私与安全性」中允许。
+> **macOS 安装提示**：产物为 universal 包（Apple Silicon / Intel 通用）与 Windows x64 安装包。
+> macOS 产物已做 ad-hoc 签名但未经过 Apple 公证（无开发者账号），首次打开若提示"无法验证开发者 / 未公证"：
+>
+> ```bash
+> xattr -cr /Applications/desktools.app   # 清除隔离属性后正常打开
+> ```
+>
+> 或在 Finder 中右键 → 打开（macOS 15+ 需在「系统设置 → 隐私与安全性」中点"仍要打开"）。
+> 若提示"文件已损坏"，说明签名无效，请在仓库提 Issue 反馈（CI 已内置签名校验，正常不会出现）。
 
 ## Recommended IDE Setup
 

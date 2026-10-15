@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, ref, shallowRef } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -11,8 +11,12 @@ const checking = ref(false);
 const installing = ref(false);
 const progress = ref(0);
 const updateState = ref<"idle" | "latest" | "update" | "error">("idle");
-const update = ref<Update | null>(null);
+// Update 是带 # 私有字段的类实例（继承 Resource），
+// 必须用 shallowRef 保存：深度响应式代理会破坏私有字段访问，
+// 调用 downloadAndInstall() 时报「Cannot read private member...」
+const update = shallowRef<Update | null>(null);
 const errorMsg = ref("");
+const installError = ref("");
 
 onMounted(() => checkUpdate());
 
@@ -20,6 +24,7 @@ async function checkUpdate() {
   checking.value = true;
   updateState.value = "idle";
   errorMsg.value = "";
+  installError.value = "";
   try {
     const found = await check();
     update.value = found ?? null;
@@ -36,6 +41,7 @@ async function installUpdate() {
   if (!update.value || installing.value) return;
   installing.value = true;
   progress.value = 0;
+  installError.value = "";
   try {
     let downloaded = 0;
     let contentLength = 0;
@@ -57,8 +63,7 @@ async function installUpdate() {
     });
     await relaunch();
   } catch (e) {
-    updateState.value = "error";
-    errorMsg.value = String(e);
+    installError.value = String(e);
     installing.value = false;
   }
 }
@@ -102,7 +107,11 @@ function openReleases() {
         <div class="bar" :style="{ width: progress + '%' }"></div>
       </div>
 
-      <p v-if="updateState === 'latest'" class="hint ok">当前已是最新版本</p>
+      <p v-if="installError" class="hint err">
+        升级失败：{{ installError }}
+        <button class="link" @click="installUpdate">重试</button>
+      </p>
+      <p v-else-if="updateState === 'latest'" class="hint ok">当前已是最新版本</p>
       <p v-else-if="updateState === 'update' && !installing" class="hint warn">
         发现新版本 {{ update?.version ?? "" }}，安装完成后将自动重启应用
         <button class="link" @click="openReleases">手动下载</button>

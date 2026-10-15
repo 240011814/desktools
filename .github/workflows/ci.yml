@@ -26,8 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest # macOS (Apple Silicon)
+          - platform: macos-latest # macOS：universal 包（Apple Silicon + Intel）
+            tauri-args: --target universal-apple-darwin
           - platform: windows-latest # Windows (x64)
+            tauri-args: ""
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -49,22 +51,29 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install macOS build targets (arm64 + x86_64)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
       - name: Build Tauri app
-        run: pnpm tauri build
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: bash scripts/tauri-build.sh build ${{ matrix.tauri-args }}
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
           name: desktools-${{ matrix.platform }}
           path: |
-            src-tauri/target/release/bundle/**/*.dmg
-            src-tauri/target/release/bundle/**/*.app.tar.gz
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.app.tar.gz
+            src-tauri/target/**/bundle/**/*.msi
+            src-tauri/target/**/bundle/**/*.exe
           if-no-files-found: error
           retention-days: 14

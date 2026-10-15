@@ -147,5 +147,6 @@ src-tauri/
 - **`arboard` 读剪贴板返回 Err 是常态**（剪贴板里是图片/文件时），直接 `continue` 忽略；监听线程 700ms 轮询。
 - **macOS 快速操作**：workflow 装在 `~/Library/Services/DeskTools 剪贴板历史.workflow`，首次可能需在「系统设置 → 键盘 → 快捷键 → 服务」启用；`pbs -update` 刷新缓存。Windows 注册表项在 `HKCU\Software\Classes\Directory\Background\shell\DeskToolsHistory`。
 - **配置/历史/日志位置**：`~/Library/Application Support/com.hyy.desktools/`（config.json、history.json），日志在 `~/Library/Logs/com.hyy.desktools/desktools.jsonl`；Windows 在 `%APPDATA%` / `%LOCALAPPDATA%` 对应目录。排查问题可直接删 config.json 重置。
+- **Tauri 类实例不能进深度响应式**：`Update`（`@tauri-apps/plugin-updater`）等继承 `Resource` 的类带 `#` 私有字段，放进 Vue `ref()` 被 Proxy 代理后调用方法会报 `TypeError: Cannot read private member from an object whose class did not declare it`（Windows/macOS 同病）。必须用 `shallowRef` 或 `markRaw` 保存类实例；纯数据对象则无此问题。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

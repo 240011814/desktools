@@ -27,8 +27,10 @@ jobs:
       max-parallel: 1 # 串行发布，避免 latest.json 多平台合并竞态
       matrix:
         include:
-          - platform: macos-latest # macOS (Apple Silicon)
+          - platform: macos-latest # macOS：universal 包（Apple Silicon + Intel）
+            tauri-args: --target universal-apple-darwin
           - platform: windows-latest # Windows (x64)
+            tauri-args: ""
     runs-on: ${{ matrix.platform }}
 
     steps:
@@ -72,6 +74,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install macOS build targets (arm64 + x86_64)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -83,6 +89,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 更新包签名私钥（由 tauri signer generate 生成，存放在仓库 Secret 中）
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # 无 Apple 开发者账号时用 ad-hoc 签名，保证 .app 签名有效
+          # （签名无效的产物在 macOS 上会提示「文件已损坏」）
+          APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ steps.version.outputs.tag }}
           releaseName: ${{ steps.version.outputs.title }}
@@ -90,11 +99,14 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          tauriScript: pnpm tauri
+          args: ${{ matrix.tauri-args }}
+          # 包装脚本：构建后做签名/架构自检，坏包直接失败（见 scripts/tauri-build.sh）
+          tauriScript: bash scripts/tauri-build.sh
           releaseBody: |
             自动构建，版本 `${{ steps.version.outputs.version }}`（commit `${{ github.sha }}`）
 
-            - macOS：`.dmg`
+            - macOS：`.dmg`（universal，Apple Silicon / Intel 通用）
             - Windows：`.exe`（NSIS）/ `.msi`
 
-            > macOS 产物未签名，首次打开需在「系统设置 → 隐私与安全性」中允许。
+            > **macOS 安装提示**：产物未做 Apple 公证，首次打开若提示"无法验证开发者"，
+            > 请右键 → 打开，或执行 `xattr -cr /Applications/desktools.app` 后再打开。
