@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "desktools",
-        "width": 800,
-        "height": 600,
+        "title": "DeskTools",
+        "width": 760,
+        "height": 720,
+        "minWidth": 560,
+        "minHeight": 480,
+        "center": true,
         "visible": false
       }
     ],
