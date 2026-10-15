@@ -7,6 +7,7 @@ mod config;
 mod history;
 mod logger;
 mod mqtt;
+mod shell_integration;
 
 use config::MqttConfig;
 use history::{HistoryItem, HistoryState};
@@ -18,6 +19,16 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+/// 弹出独立的剪贴板历史小窗口（桌面右键 / 托盘菜单调用）
+fn show_history_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("history") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        logger::log(app, logger::INFO, "已打开剪贴板历史窗口");
     }
 }
 
@@ -97,9 +108,38 @@ fn clear_logs(app: tauri::AppHandle) {
     logger::log(&app, logger::INFO, "日志已清空");
 }
 
+#[tauri::command]
+fn get_desktop_integration() -> shell_integration::IntegrationStatus {
+    shell_integration::status()
+}
+
+#[tauri::command]
+fn set_desktop_integration(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<shell_integration::IntegrationStatus, String> {
+    shell_integration::set_enabled(enabled)?;
+    logger::log(
+        &app,
+        logger::INFO,
+        if enabled {
+            "已启用桌面右键菜单集成（剪贴板历史）"
+        } else {
+            "已关闭桌面右键菜单集成"
+        },
+    );
+    Ok(shell_integration::status())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例：桌面右键/快速操作再次启动时，转发给已运行实例打开历史窗口
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if argv.iter().any(|arg| arg == "--history") {
+                show_history_window(app);
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -119,13 +159,17 @@ pub fn run() {
             clear_history,
             copy_to_clipboard,
             get_logs,
-            clear_logs
+            clear_logs,
+            get_desktop_integration,
+            set_desktop_integration
         ])
         .setup(|app| {
-            // 托盘图标与菜单
+            // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）
+            let history_item =
+                MenuItem::with_id(app, "history", "剪贴板历史", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let menu = Menu::with_items(app, &[&history_item, &show_item, &quit_item])?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(
@@ -137,6 +181,7 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
+                    "history" => show_history_window(app),
                     "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
@@ -200,8 +245,10 @@ pub fn run() {
             // 开机自动启动（登录时以 --hidden 启动，仅驻留托盘）
             let _ = app.autolaunch().enable();
 
-            // 手动启动时显示主窗口
-            if !std::env::args().any(|arg| arg == "--hidden") {
+            // 启动参数决定初始窗口：--history 弹历史窗口，--hidden 仅驻留托盘
+            if std::env::args().any(|arg| arg == "--history") {
+                show_history_window(app.app_handle());
+            } else if !std::env::args().any(|arg| arg == "--hidden") {
                 show_main_window(app.app_handle());
             }
             Ok(())

@@ -81,11 +81,71 @@
 
 ## 项目概述
 
+desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS / Windows），核心是**跨设备剪贴板同步**：
+
+- **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
+- **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
+- **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
+- **系统集成**：桌面右键菜单弹出历史小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow）；托盘右键菜单含「剪贴板历史 / 显示主窗口 / 退出」。
+- **其他**：开机自启（`--hidden` 仅托盘）、关闭最小化到托盘、minisign 验签自动更新（版本号 `1.0.<git 提交数>`）。
+
 ## 常用命令
+
+```bash
+# 开发（前端 vite + Tauri 窗口）
+pnpm install
+pnpm tauri dev
+
+# 前端类型检查 + 构建
+pnpm build
+
+# 打包（产物在 src-tauri/target/release/bundle/）
+pnpm tauri build
+
+# Rust 单元测试（在 src-tauri/ 下执行）
+cd src-tauri && cargo test
+
+# 仅编译检查 Rust
+cd src-tauri && cargo check
+```
 
 ## 项目结构
 
+```
+src/                          # Vue 3 前端
+  App.vue                     # 外壳：侧边栏菜单 + 页面切换（?popup=history 时渲染独立历史小窗口）
+  store.ts                    # 共享状态与类型（mqttStatus、version、MqttConfig、HistoryItem、LogEntry）
+  styles.css                  # 全局设计变量（深浅色自适应）与通用组件样式（卡片/按钮/表单/开关/徽章/空状态）
+  components/
+    HistoryPage.vue           # 剪贴板历史（compact 属性 = 小窗口紧凑布局）
+    LogPage.vue               # 运行日志（级别筛选 / 刷新 / 清空）
+    UpdatePage.vue            # 软件更新检测与安装
+    SettingsPage.vue          # 系统设置：MQTT 同步配置 + 桌面右键集成 + 开机自启
+src-tauri/
+  src/
+    lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --hidden）
+    config.rs                 # MqttConfig 持久化（config.json）与校验
+    mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）
+    history.rs                # 剪贴板历史（200 条上限、去重置顶、history.json）
+    logger.rs                 # 运行日志（内存 + JSONL 轮转，preview() 截断长文本）
+    shell_integration.rs      # 桌面右键集成（Windows 注册表 / macOS 快速操作 workflow）
+  capabilities/desktop.json   # 桌面端插件权限（剪贴板必须显式声明！）
+  tauri.conf.json             # 窗口（main / history）与打包配置
+```
+
 ## 代码规范
 
+- **前端**：Vue 3 `<script setup lang="ts">`；共享状态放 `src/store.ts`（ref + 接口），页面组件放 `src/components/`；通用样式写 `styles.css` 全局类（`.card` `.btn` `.switch` `.hint` `.empty` 等），组件只写 `scoped` 差异样式；与 Rust 通信用 `invoke`（命令）与 `listen`（事件），全部包 try/catch 保证浏览器预览不报错。
+- **后端**：每个领域一个模块（config / mqtt / history / logger / shell_integration）；命令集中在 `lib.rs` 注册；事件名形如 `mqtt://status`、`history://changed`、`log://changed`；serde 统一 `#[serde(rename_all = "camelCase")]`，前端接口与之对应。
+- **测试**：纯逻辑（校验、去重、轮转、消息解析）写单元测试，触碰系统（AppHandle / 文件 / 注册表）的逻辑抽成可注入路径的纯函数再测。
+
 ## 开发经验 / 注意事项
+
+- **剪贴板插件权限是空集**：`clipboard-manager:default` 不含任何权限（插件故意如此），必须在 `capabilities/desktop.json` 显式加 `clipboard-manager:allow-read-text / allow-write-text / allow-clear`，否则前端 `writeText` 报"权限"错误（macOS/Windows 都一样）。前端复制统一走后端命令 `copy_to_clipboard` 更稳。
+- **MQTT client id = `desktools-<deviceId>`**：同一 deviceId 起两个实例会互踢连接（broker 端 client id 冲突）。已加 `tauri-plugin-single-instance`，桌面右键/快速操作二次启动会转发 `--history` 给已运行实例。排查时注意别同时跑 `pnpm tauri dev` 和手动启动的二进制。
+- **防回环三道闸**：消息带 `deviceId`（自己的忽略）→ 收到远端先更新 `last_clip` 再写剪贴板 → 监听线程发现内容等于 `last_clip` 不再发布/记录。
+- **`arboard` 读剪贴板返回 Err 是常态**（剪贴板里是图片/文件时），直接 `continue` 忽略；监听线程 700ms 轮询。
+- **macOS 快速操作**：workflow 装在 `~/Library/Services/DeskTools 剪贴板历史.workflow`，首次可能需在「系统设置 → 键盘 → 快捷键 → 服务」启用；`pbs -update` 刷新缓存。Windows 注册表项在 `HKCU\Software\Classes\Directory\Background\shell\DeskToolsHistory`。
+- **配置/历史/日志位置**：`~/Library/Application Support/com.hyy.desktools/`（config.json、history.json），日志在 `~/Library/Logs/com.hyy.desktools/desktools.jsonl`；Windows 在 `%APPDATA%` / `%LOCALAPPDATA%` 对应目录。排查问题可直接删 config.json 重置。
+- **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

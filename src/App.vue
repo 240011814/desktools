@@ -3,16 +3,17 @@ import { computed, onMounted, ref } from "vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import SyncPage from "./components/SyncPage.vue";
 import HistoryPage from "./components/HistoryPage.vue";
 import LogPage from "./components/LogPage.vue";
 import UpdatePage from "./components/UpdatePage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import { mqttStatus, version, STATUS_TEXT, type MqttStatus } from "./store";
 
+/** 独立历史小窗口模式（桌面右键 / 托盘菜单弹出） */
+const isPopup = new URLSearchParams(location.search).get("popup") === "history";
+
 /* 侧边栏菜单（icon 为 24x24 stroke 图标） */
 const ICONS: Record<string, string> = {
-  sync: '<path d="M21 4v5h-5"/><path d="M3 20v-5h5"/><path d="M20.4 9A8.5 8.5 0 0 0 5.4 6.2L3 8.5"/><path d="M3.6 15A8.5 8.5 0 0 0 18.6 17.8L21 15.5"/>',
   history:
     '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
   log: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/>',
@@ -23,7 +24,6 @@ const ICONS: Record<string, string> = {
 };
 
 const TABS = [
-  { id: "sync", label: "剪贴板同步", icon: "sync" },
   { id: "history", label: "剪贴板历史", icon: "history" },
   { id: "log", label: "日志", icon: "log" },
   { id: "update", label: "软件更新", icon: "update" },
@@ -33,7 +33,6 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 const pages: Record<TabId, unknown> = {
-  sync: SyncPage,
   history: HistoryPage,
   log: LogPage,
   update: UpdatePage,
@@ -42,7 +41,7 @@ const pages: Record<TabId, unknown> = {
 
 function tabFromHash(): TabId {
   const hash = location.hash.slice(1) as TabId;
-  return TABS.some((tab) => tab.id === hash) ? hash : "sync";
+  return TABS.some((tab) => tab.id === hash) ? hash : "history";
 }
 
 const active = ref<TabId>(tabFromHash());
@@ -77,7 +76,10 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="shell">
+  <!-- 独立历史小窗口（托盘 / 桌面右键弹出） -->
+  <HistoryPage v-if="isPopup" compact />
+
+  <div v-else class="shell">
     <aside class="sidebar">
       <div class="brand">
         <div class="logo">

@@ -171,7 +171,11 @@ fn handle_incoming(app: &AppHandle, payload: &[u8]) {
     logger::log(
         app,
         INFO,
-        format!("收到远端内容，已写入剪贴板（{} 字符）", text.chars().count()),
+        format!(
+            "收到远端内容，已写入剪贴板（{} 字符）：{}",
+            text.chars().count(),
+            logger::preview(&text)
+        ),
     );
     #[cfg(desktop)]
     {
@@ -242,6 +246,7 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                     continue;
                 };
                 let cfg = app.state::<SyncState>().config.lock().unwrap().clone();
+                let preview = logger::preview(&text);
                 let payload = serde_json::json!({
                     "deviceId": cfg.device_id,
                     "text": text,
@@ -255,7 +260,10 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                 logger::log(
                     &app,
                     INFO,
-                    format!("已发送同步内容（{} 字符）", text.chars().count()),
+                    format!(
+                        "已发送同步内容（{} 字符）：{preview}",
+                        text.chars().count()
+                    ),
                 );
                 *last_clip.lock().unwrap() = text;
             }

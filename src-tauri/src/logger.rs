@@ -99,6 +99,17 @@ impl LogState {
     }
 }
 
+/// 截断长文本用于日志展示（超过 500 字符只记前 500 字符并标注）
+pub fn preview(text: &str) -> String {
+    const MAX: usize = 500;
+    let total = text.chars().count();
+    if total <= MAX {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX).collect();
+    format!("{head}…（已截断，共 {total} 字符）")
+}
+
 /// 记录一条日志（LogState 未初始化时静默忽略）
 pub fn log(app: &AppHandle, level: &str, message: impl AsRef<str>) {
     if let Some(state) = app.try_state::<LogState>() {

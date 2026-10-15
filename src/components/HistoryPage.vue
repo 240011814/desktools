@@ -4,6 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { HistoryItem } from "../store";
 
+/** compact：独立历史小窗口布局（桌面右键 / 托盘弹出） */
+defineProps<{ compact?: boolean }>();
+
 const HISTORY_LIMIT = 200;
 
 const items = ref<HistoryItem[]>([]);
@@ -93,7 +96,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" :class="{ compact }">
     <header class="page-head">
       <h1>剪贴板历史</h1>
       <p>自动保存最近 {{ HISTORY_LIMIT }} 条复制记录，点击任意条目即可重新复制</p>
@@ -150,6 +153,34 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 独立小窗口紧凑布局 */
+.page.compact {
+  padding: 14px 16px 20px;
+  max-width: none;
+}
+
+.page.compact .page-head {
+  margin-bottom: 12px;
+}
+
+.page.compact .page-head h1 {
+  font-size: 1.05rem;
+}
+
+.page.compact .page-head p,
+.page.compact > .card > .hint {
+  display: none;
+}
+
+.page.compact .card {
+  margin-bottom: 0;
+  padding: 14px 14px;
+}
+
+.page.compact .history-list {
+  max-height: calc(100vh - 190px);
+}
+
 .history-list {
   display: flex;
   flex-direction: column;
