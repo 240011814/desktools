@@ -124,50 +124,86 @@ pub fn in_cooldown(last_lock_ms: i64, now: i64) -> bool {
     now - last_lock_ms < LOCK_COOLDOWN_MS
 }
 
-/// 锁定屏幕，返回实际使用的锁定方式（供日志）
+/// 锁定屏幕，返回实际使用的锁定方式（供日志）。
+/// 链路：系统锁屏接口（真锁屏，无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ pmset 息屏（需「唤醒时需要密码」），
+/// 逐级降级并收集失败原因。
 fn lock_screen() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        // 1) 系统「锁定屏幕」快捷键 Ctrl+Cmd+Q（需要辅助功能权限，失败则降级）
-        let keystroke = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                r#"tell application "System Events" to keystroke "q" using {control down, command down}"#,
-            ])
-            .output()
-            .map_err(|e| format!("osascript 启动失败：{e}"))?;
-        if keystroke.status.success() {
-            return Ok("系统快捷键 Ctrl+Cmd+Q".into());
+        let mut errors = Vec::new();
+        match sac_lock_screen() {
+            Ok(()) => return Ok("系统锁屏接口 SACLockScreenImmediate".into()),
+            Err(err) => errors.push(err),
         }
-        // 2) 降级：立即息屏；系统设置「唤醒时需要密码」时等效锁屏（无需任何权限）
-        let sleep_display = std::process::Command::new("pmset")
-            .arg("displaysleepnow")
-            .output()
-            .map_err(|e| format!("pmset 启动失败：{e}"))?;
-        if sleep_display.status.success() {
-            return Ok("pmset displaysleepnow（等效锁屏，建议开启「唤醒时需要密码」）".into());
+        // Ctrl+Cmd+Q 系统「锁定屏幕」快捷键（需要辅助功能权限）
+        match run_and_check("osascript", &[
+            "-e",
+            r#"tell application "System Events" to keystroke "q" using {control down, command down}"#,
+        ]) {
+            Ok(()) => return Ok("系统快捷键 Ctrl+Cmd+Q".into()),
+            Err(err) => errors.push(format!("Ctrl+Cmd+Q：{err}")),
         }
-        let mut err = String::from_utf8_lossy(&keystroke.stderr).trim().to_string();
-        if err.is_empty() {
-            err = String::from_utf8_lossy(&sleep_display.stderr).trim().to_string();
+        // 最后降级：立即息屏；系统设置「唤醒时需要密码」时等效锁屏（无需任何权限）
+        match run_and_check("pmset", &["displaysleepnow"]) {
+            Ok(()) => {
+                return Ok("pmset displaysleepnow 息屏（等效锁屏，建议开启「唤醒时需要密码」）".into())
+            }
+            Err(err) => errors.push(format!("pmset 息屏：{err}")),
         }
-        Err(format!("两种锁定方式均失败：{err}"))
+        Err(format!("三种锁定方式均失败：{}", errors.join("；")))
     }
     #[cfg(target_os = "windows")]
     {
-        let out = std::process::Command::new("rundll32.exe")
-            .args(["user32.dll,LockWorkStation"])
-            .output()
-            .map_err(|e| format!("rundll32 启动失败：{e}"))?;
-        if out.status.success() {
-            Ok("LockWorkStation".into())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        match run_and_check("rundll32.exe", &["user32.dll,LockWorkStation"]) {
+            Ok(()) => Ok("LockWorkStation".into()),
+            Err(err) => Err(format!("LockWorkStation 失败：{err}")),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err("当前平台不支持自动锁屏".into())
+    }
+}
+
+/// 执行命令并要求退出成功，失败时带上 stderr（供日志诊断）
+fn run_and_check(program: &str, args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("{program} 启动失败：{e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let mut err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.is_empty() {
+            err = format!("退出码 {}", out.status);
+        }
+        Err(err)
+    }
+}
+
+/// macOS 系统锁屏接口（LoginUIKit 私有框架）：真正的锁屏界面、必须输密码，且无需任何 TCC 权限。
+/// 私有接口可能随系统更新变化，因此调用失败时由上层降级到快捷键 / 息屏。
+#[cfg(target_os = "macos")]
+fn sac_lock_screen() -> Result<(), String> {
+    use std::ffi::CString;
+    unsafe {
+        let path = CString::new("/System/Library/PrivateFrameworks/LoginUIKit.framework/LoginUIKit")
+            .map_err(|e| e.to_string())?;
+        let symbol = CString::new("SACLockScreenImmediate").map_err(|e| e.to_string())?;
+        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            return Err("dlopen LoginUIKit 失败".into());
+        }
+        let func = libc::dlsym(handle, symbol.as_ptr());
+        if func.is_null() {
+            libc::dlclose(handle);
+            return Err("dlsym SACLockScreenImmediate 失败".into());
+        }
+        let lock_screen: extern "C" fn() = std::mem::transmute(func);
+        lock_screen();
+        libc::dlclose(handle);
+        Ok(())
     }
 }
 

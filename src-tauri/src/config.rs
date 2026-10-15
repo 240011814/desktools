@@ -31,7 +31,7 @@ pub struct MqttConfig {
 }
 
 fn default_auto_lock_delay_secs() -> u64 {
-    5
+    15
 }
 
 impl Default for MqttConfig {

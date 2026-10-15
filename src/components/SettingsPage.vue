@@ -289,13 +289,13 @@ onMounted(() => {
       </label>
       <div v-if="form.autoLock" class="form-grid" style="margin-top: 12px">
         <label class="field">
-          <span>锁屏延迟（秒）</span>
+          <span>锁屏前等待（秒）</span>
           <input
             v-model.number="form.autoLockDelaySecs"
             type="number"
             min="1"
             max="300"
-            placeholder="5"
+            placeholder="15"
             @change="saveAutoLock()"
           />
         </label>
@@ -303,9 +303,8 @@ onMounted(() => {
       <p v-if="autoLockError" class="hint err">{{ autoLockError }}</p>
       <p v-else-if="autoLockSaved" class="hint ok">自动锁屏设置已保存</p>
       <p v-else class="hint">
-        开启后订阅 {{ csiTopic }}（需先配置 MQTT 连接）：收到「人离开」事件后延迟锁屏，期间检测到有人回来自动取消，
-        两次锁屏间隔至少 60 秒。macOS 首次锁屏可能请求「辅助功能」权限，未授权时自动降级为息屏
-        （建议开启「系统设置 → 锁定屏幕 → 唤醒时需要密码」）。
+        开启后订阅 {{ csiTopic }}（需先配置 MQTT 连接）：收到「人离开」后开始倒计时，<b>期间收到「靠近」自动取消</b>，
+        倒计时结束才真正锁屏。考虑消息投递延迟，建议等待 15~30 秒；两次锁屏间隔至少 60 秒。
       </p>
     </section>
 
