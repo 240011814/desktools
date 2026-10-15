@@ -8,6 +8,7 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::auto_lock::{self, AutoLockState};
 use crate::clipboard;
 use crate::config::MqttConfig;
 use crate::history::{now_ms, HistoryState};
@@ -38,6 +39,15 @@ pub struct SyncMessage {
 
 /// 收到消息的内存队列容量（超出后丢弃并记 WARN，避免慢消费拖垮 MQTT 事件循环）
 const INCOMING_QUEUE_CAPACITY: usize = 512;
+
+/// 消息队列中的待处理消息（按订阅 topic 分型）
+#[derive(Debug, PartialEq)]
+pub enum QueuedMsg {
+    /// 剪贴板同步消息（texthub/<group>）
+    Clip(String),
+    /// CSI 人体感知消息（csi/notify，自动锁屏用）
+    Csi(String),
+}
 /// 本机发布内容的回流识别：只保留最近若干条、数十秒内有效。
 /// 回流链路 = 本机发布 → 对端收到（网络延迟）→ 对端监听线程周期（≤700ms）→ 回发 → 本机收到，
 /// 带宽紧张时可到数秒，故窗口取 10s。副作用：10s 内跨设备重复复制同一文本会被当作回流忽略，
@@ -60,9 +70,9 @@ pub struct SyncState {
     /// 最近发布出去的（文本, 时间），用于识别对端回流回来的本机内容
     recent_sent: Mutex<VecDeque<(String, i64)>>,
     /// 收到的 MQTT 消息入队，由后台单线程顺序处理
-    incoming_tx: SyncSender<String>,
+    incoming_tx: SyncSender<QueuedMsg>,
     /// 仅允许取一次：消费线程启动时取走 Receiver
-    incoming_rx: Mutex<Option<Receiver<String>>>,
+    incoming_rx: Mutex<Option<Receiver<QueuedMsg>>>,
 }
 
 impl SyncState {
@@ -128,14 +138,14 @@ impl SyncState {
     }
 
     /// 收到的 MQTT 消息入队（队列满时丢弃，由调用方记日志）
-    pub fn enqueue_incoming(&self, raw: String) -> Result<(), String> {
+    pub fn enqueue_incoming(&self, msg: QueuedMsg) -> Result<(), String> {
         self.incoming_tx
-            .try_send(raw)
+            .try_send(msg)
             .map_err(|e| format!("消息入队失败：{e}"))
     }
 
     /// 取走队列接收端（幂等，仅首次成功）
-    pub fn take_incoming_receiver(&self) -> Option<Receiver<String>> {
+    pub fn take_incoming_receiver(&self) -> Option<Receiver<QueuedMsg>> {
         self.incoming_rx.lock().unwrap().take()
     }
 }
@@ -205,11 +215,22 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                     if let Some(client) = app.state::<SyncState>().client() {
                         let _ = client.subscribe(topic.clone(), QoS::AtLeastOnce).await;
                         logger::log(&app, INFO, format!("MQTT 已连接，已订阅 {topic}"));
+                        // 离人自动锁屏开启时，额外订阅 CSI 人体感知主题
+                        if cfg.auto_lock {
+                            let _ = client
+                                .subscribe(auto_lock::CSI_NOTIFY_TOPIC, QoS::AtLeastOnce)
+                                .await;
+                            logger::log(
+                                &app,
+                                INFO,
+                                format!("自动锁屏已开启，已订阅 {}", auto_lock::CSI_NOTIFY_TOPIC),
+                            );
+                        }
                     }
                     set_status(&app, "connected", "已连接", topic.clone());
                 }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
-                    handle_incoming(&app, &publish.payload);
+                    handle_incoming(&app, &publish.topic, &publish.payload);
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -233,15 +254,21 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
     });
 }
 
-/// 收到消息：仅入队，处理交给后台单线程（不在 MQTT 事件循环里做剪贴板/历史 IO）
-fn handle_incoming(app: &AppHandle, payload: &[u8]) {
+/// 收到消息：按 topic 分型入队，处理交给后台单线程（不在 MQTT 事件循环里做剪贴板/历史/锁屏 IO）
+fn handle_incoming(app: &AppHandle, topic: &str, payload: &[u8]) {
     let raw = String::from_utf8_lossy(payload).to_string();
-    if let Err(err) = app.state::<SyncState>().enqueue_incoming(raw) {
+    let msg = if topic == auto_lock::CSI_NOTIFY_TOPIC {
+        QueuedMsg::Csi(raw)
+    } else {
+        QueuedMsg::Clip(raw)
+    };
+    if let Err(err) = app.state::<SyncState>().enqueue_incoming(msg) {
         logger::log(app, WARN, format!("{err}，消息已丢弃"));
     }
 }
 
-/// 启动后台消息处理线程：单线程顺序消费队列（解析 → 记历史 → 写剪贴板）
+/// 启动后台消息处理线程：单线程顺序消费队列
+/// （剪贴板消息：解析 → 记历史 → 写剪贴板；CSI 消息：自动锁屏判断）
 pub fn spawn_message_worker(app: AppHandle) {
     let Some(rx) = app.state::<SyncState>().take_incoming_receiver() else {
         return;
@@ -249,8 +276,11 @@ pub fn spawn_message_worker(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("mqtt-message-worker".into())
         .spawn(move || {
-            while let Ok(raw) = rx.recv() {
-                process_incoming(&app, &raw);
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    QueuedMsg::Clip(raw) => process_incoming(&app, &raw),
+                    QueuedMsg::Csi(raw) => app.state::<AutoLockState>().handle_event(&app, &raw),
+                }
             }
         });
 }
@@ -399,11 +429,11 @@ mod tests {
     #[test]
     fn queues_incoming_messages_in_order() {
         let sync = SyncState::new(MqttConfig::default());
-        sync.enqueue_incoming("first".into()).unwrap();
-        sync.enqueue_incoming("second".into()).unwrap();
+        sync.enqueue_incoming(QueuedMsg::Clip("first".into())).unwrap();
+        sync.enqueue_incoming(QueuedMsg::Csi("second".into())).unwrap();
         let rx = sync.take_incoming_receiver().unwrap();
-        assert_eq!(rx.recv().unwrap(), "first");
-        assert_eq!(rx.recv().unwrap(), "second");
+        assert_eq!(rx.recv().unwrap(), QueuedMsg::Clip("first".into()));
+        assert_eq!(rx.recv().unwrap(), QueuedMsg::Csi("second".into()));
         // 接收端只能取一次
         assert!(sync.take_incoming_receiver().is_none());
     }

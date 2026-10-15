@@ -3,6 +3,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 
+mod auto_lock;
 mod clipboard;
 mod config;
 mod history;
@@ -58,6 +59,10 @@ fn save_mqtt_config(app: tauri::AppHandle, mut cfg: MqttConfig) -> Result<MqttCo
     {
         let state = app.state::<SyncState>();
         *state.config.lock().unwrap() = cfg.clone();
+    }
+    // 关闭离人自动锁屏时，取消挂起中的延迟锁屏
+    if !cfg.auto_lock {
+        app.state::<auto_lock::AutoLockState>().cancel_all(&app);
     }
     // 应用新配置并重连（自动订阅 texthub/<group>）
     mqtt::start(app, cfg.clone());
@@ -207,6 +212,7 @@ pub fn run() {
             let cfg = MqttConfig::load(&config::config_path(app.handle()));
             app.manage(SyncState::new(cfg.clone()));
             app.manage(HistoryState::load(config::history_path(app.handle())));
+            app.manage(auto_lock::AutoLockState::default());
             let log_path = app
                 .path()
                 .app_log_dir()

@@ -86,6 +86,7 @@ desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS 
 - **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
 - **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
+- **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 延迟数秒锁屏（`autoLockDelaySecs`，默认 5s），期间收到 `approach` 自动取消；两次锁屏至少间隔 60s。macOS 锁屏走 Ctrl+Cmd+Q（需辅助功能权限），失败自动降级 `pmset displaysleepnow`；Windows 走 `LockWorkStation`。
 - **系统集成**：桌面右键菜单弹出历史小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow）；托盘右键菜单含「剪贴板历史 / 显示主窗口 / 退出」。
 - **其他**：开机自启（`--hidden` 仅托盘）、关闭最小化到托盘、minisign 验签自动更新（版本号 `1.0.<git 提交数>`）。
 
@@ -124,6 +125,7 @@ src/                          # Vue 3 前端
 src-tauri/
   src/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --hidden）
+    auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）
     clipboard.rs              # 写剪贴板统一入口（写后读回校验 + 竞争重试），copy_to_clipboard 共用
     config.rs                 # MqttConfig 持久化（config.json）与校验
     mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）；收包只入队，后台单线程消费

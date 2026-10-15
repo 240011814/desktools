@@ -10,6 +10,10 @@ export interface MqttConfig {
   tls: boolean;
   group: string;
   deviceId: string;
+  /** 离人自动锁屏：收到 csi/notify 的 leave 事件时自动锁屏 */
+  autoLock: boolean;
+  /** 收到 leave 后延迟多少秒锁屏（1~300） */
+  autoLockDelaySecs: number;
 }
 
 export type MqttState = "idle" | "connecting" | "connected" | "reconnecting" | "error";

@@ -29,6 +29,8 @@ const form = reactive<MqttConfig>({
   tls: false,
   group: "",
   deviceId: "",
+  autoLock: false,
+  autoLockDelaySecs: 5,
 });
 
 const saving = ref(false);
@@ -62,6 +64,37 @@ async function saveConfig() {
     configError.value = String(e);
   } finally {
     saving.value = false;
+  }
+}
+
+/* ---------------- 离人自动锁屏 ---------------- */
+const csiTopic = "csi/notify";
+const autoLockBusy = ref(false);
+const autoLockError = ref("");
+const autoLockSaved = ref(false);
+
+async function toggleAutoLock() {
+  const prev = form.autoLock;
+  form.autoLock = !prev;
+  await saveAutoLock(prev);
+}
+
+async function saveAutoLock(prev?: boolean) {
+  if (autoLockBusy.value) return;
+  autoLockBusy.value = true;
+  autoLockError.value = "";
+  autoLockSaved.value = false;
+  try {
+    form.autoLockDelaySecs = Math.min(300, Math.max(1, Number(form.autoLockDelaySecs) || 5));
+    const saved = await invoke<MqttConfig>("save_mqtt_config", { cfg: { ...form } });
+    Object.assign(form, saved);
+    autoLockSaved.value = true;
+    setTimeout(() => (autoLockSaved.value = false), 4000);
+  } catch (e) {
+    autoLockError.value = String(e);
+    if (prev !== undefined) form.autoLock = prev; // 保存失败时开关回退
+  } finally {
+    autoLockBusy.value = false;
   }
 }
 
@@ -234,6 +267,46 @@ onMounted(() => {
       </label>
       <p v-if="integrationError" class="hint err">{{ integrationError }}</p>
       <p v-else class="hint">{{ integration.detail }}</p>
+    </section>
+
+    <!-- 离人自动锁屏 -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>离人自动锁屏</h2>
+          <p class="card-sub">订阅 {{ csiTopic }} 人体感知事件，检测到人离开时自动锁屏</p>
+        </div>
+      </div>
+      <label class="switch" :class="{ disabled: autoLockBusy }">
+        <input
+          type="checkbox"
+          :checked="form.autoLock"
+          :disabled="autoLockBusy"
+          @change="toggleAutoLock"
+        />
+        <span class="track"><span class="thumb"></span></span>
+        <span class="switch-text">开启自动锁屏</span>
+      </label>
+      <div v-if="form.autoLock" class="form-grid" style="margin-top: 12px">
+        <label class="field">
+          <span>锁屏延迟（秒）</span>
+          <input
+            v-model.number="form.autoLockDelaySecs"
+            type="number"
+            min="1"
+            max="300"
+            placeholder="5"
+            @change="saveAutoLock()"
+          />
+        </label>
+      </div>
+      <p v-if="autoLockError" class="hint err">{{ autoLockError }}</p>
+      <p v-else-if="autoLockSaved" class="hint ok">自动锁屏设置已保存</p>
+      <p v-else class="hint">
+        开启后订阅 {{ csiTopic }}（需先配置 MQTT 连接）：收到「人离开」事件后延迟锁屏，期间检测到有人回来自动取消，
+        两次锁屏间隔至少 60 秒。macOS 首次锁屏可能请求「辅助功能」权限，未授权时自动降级为息屏
+        （建议开启「系统设置 → 锁定屏幕 → 唤醒时需要密码」）。
+      </p>
     </section>
 
     <!-- 启动 -->

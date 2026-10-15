@@ -22,6 +22,16 @@ pub struct MqttConfig {
     pub group: String,
     /// 本机唯一标识，用于区分消息来源
     pub device_id: String,
+    /// 离人自动锁屏：收到 csi/notify 的 leave 事件时自动锁屏
+    #[serde(default)]
+    pub auto_lock: bool,
+    /// 收到 leave 后延迟多少秒锁屏（期间检测到有人回来则取消）
+    #[serde(default = "default_auto_lock_delay_secs")]
+    pub auto_lock_delay_secs: u64,
+}
+
+fn default_auto_lock_delay_secs() -> u64 {
+    5
 }
 
 impl Default for MqttConfig {
@@ -34,6 +44,8 @@ impl Default for MqttConfig {
             tls: false,
             group: String::new(),
             device_id: uuid::Uuid::new_v4().to_string(),
+            auto_lock: false,
+            auto_lock_delay_secs: default_auto_lock_delay_secs(),
         }
     }
 }
@@ -83,6 +95,9 @@ impl MqttConfig {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err("Group 号只能包含字母、数字、中划线和下划线".into());
+        }
+        if self.auto_lock && (self.auto_lock_delay_secs == 0 || self.auto_lock_delay_secs > 300) {
+            return Err("锁屏延迟需在 1 ~ 300 秒之间".into());
         }
         Ok(())
     }
