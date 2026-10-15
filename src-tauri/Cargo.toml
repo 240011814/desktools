@@ -33,9 +33,11 @@ libc = "0.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# 注意：lto 用 thin 而非 full、codegen-units 不设 1——full LTO + CGU=1 会让 CI 编译
+# 多花 3~5 分钟（universal 构建还要 ×2），产物体积/性能差异几乎可忽略。
 [profile.release]
-codegen-units = 1
-lto = true
+codegen-units = 16
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true
