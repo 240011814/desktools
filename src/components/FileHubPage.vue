@@ -339,7 +339,6 @@ onUnmounted(() => {
   <div class="page" :class="{ compact }">
     <header class="page-head">
       <h1>文件中转站</h1>
-      <p>通过 MinIO 在多台设备之间上传、下载、删除文件（bucket：{{ bucketName }}；支持拖拽文件、粘贴剪贴板图片上传；同名文件会覆盖）</p>
     </header>
 
     <p v-if="error" class="hint err">{{ error }}</p>
