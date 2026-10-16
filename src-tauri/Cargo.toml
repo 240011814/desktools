@@ -23,7 +23,6 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri-plugin-clipboard-manager = "2"
 tauri-plugin-os = "2"
 tauri-plugin-process = "2"
 rumqttc = "0.25"
@@ -53,6 +52,8 @@ strip = true
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-autostart = "2"
+# 剪贴板统一走自持 arboard 实例（见 clipboard.rs：插件的退出时 take() 会导致并发 panic）
+arboard = { version = "3", features = ["image-data", "wayland-data-control"] }
 tauri-plugin-updater = "2"
 tauri-plugin-single-instance = "2"
 

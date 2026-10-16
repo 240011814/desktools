@@ -221,14 +221,10 @@ pub async fn upload_image(
 ) -> Result<String, String> {
     require_configured(cfg)?;
     let key = clipboard_key(name_hint);
-    let app_owned = app.clone();
-    let png = tokio::task::spawn_blocking(move || {
-        use tauri_plugin_clipboard_manager::ClipboardExt;
-        let image = app_owned
-            .clipboard()
-            .read_image()
+    let png = tokio::task::spawn_blocking(|| {
+        let (width, height, rgba) = crate::clipboard::read_image()
             .map_err(|_| "剪贴板中没有图片（截图或复制图片后再试）".to_string())?;
-        encode_png_rgba(image.width(), image.height(), image.rgba())
+        encode_png_rgba(width, height, &rgba)
     })
     .await
     .map_err(|e| format!("读取剪贴板图片失败：{e}"))??;

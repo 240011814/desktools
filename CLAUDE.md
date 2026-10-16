@@ -129,7 +129,7 @@ src-tauri/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --files / --hidden）
     auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）+ 锁屏能力自检
     autostart.rs              # 开机自启：config.json 的 autoStart 意图持久化 + 启动时与系统状态对齐（dev 构建跳过）
-    clipboard.rs              # 写剪贴板统一入口（写后读回校验 + 竞争重试），copy_to_clipboard 共用
+    clipboard.rs              # 剪贴板统一入口：自持 arboard 单例（读文本/图片，写后读回校验 + 竞争重试）
     config.rs                 # MqttConfig / MinioConfig 持久化（config.json）与校验、MinIO 地址容错解析、bucket 名校验
     file_hub.rs               # 文件中转站：MinIO 上传 / 下载 / 删除 / 剪贴板图片转 PNG 上传（rust-s3，bucket 可配置，进度事件 filehub://progress）
     secret.rs                 # 本地凭据加密：机器绑定 HKDF-SHA256 + AES-256-GCM（enc:v1: 格式）
@@ -137,7 +137,7 @@ src-tauri/
     history.rs                # 剪贴板历史（200 条上限、去重置顶、history.json）
     logger.rs                 # 运行日志（内存 + JSONL 轮转，preview() 截断长文本）
     shell_integration.rs      # 桌面右键集成（Windows 注册表 / macOS 快速操作 workflow，条目表 ENTRIES）
-  capabilities/               # 窗口权限：default.json（core/opener，覆盖 main + history + files）、desktop.json（桌面端插件权限，剪贴板必须显式声明！）
+  capabilities/               # 窗口权限：default.json（core/opener，覆盖 main + history + files）、desktop.json（桌面端插件权限）
   tauri.conf.json             # 窗口（main / history / files）与打包配置
 ```
 
@@ -149,13 +149,13 @@ src-tauri/
 
 ## 开发经验 / 注意事项
 
-- **剪贴板插件权限是空集**：`clipboard-manager:default` 不含任何权限（插件故意如此），必须在 `capabilities/desktop.json` 显式加 `clipboard-manager:allow-read-text / allow-write-text / allow-clear`，否则前端 `writeText` 报"权限"错误（macOS/Windows 都一样）。前端复制统一走后端命令 `copy_to_clipboard` 更稳。
+- **剪贴板不走 `tauri-plugin-clipboard-manager`**：该插件在 `RunEvent::Exit` 时会 `take()` 掉内部 arboard 实例（arboard 建议退出前 drop），其后到进程退出之间是窗口期（`cleanup_before_exit` 卸托盘等仍有几十~几百 ms），700ms 轮询的监听线程一旦此时调用 `read_text()`，就会命中插件内部 `.as_mut().unwrap()` panic；release 构建 `panic = "abort"`，表现为**退出瞬间 SIGABRT**（1.0.14 崩溃报告实证：崩溃线程 clipboard-watcher，主线程正卡在 `NSStatusBar _removeStatusItem`）。现在 `clipboard.rs` 自持 arboard 单例（进程内所有线程共用、永不 take，退出时由进程统一回收），从结构上消除竞态；连带移除了插件依赖 / capability `clipboard-manager:*` 权限 / npm 包。**教训：第三方封装凡是「退出时置空共享状态、又可能被后台线程并发使用」的，都要提前隔离掉。**
 - **MQTT client id = `desktools-<deviceId>`**：同一 deviceId 起两个实例会互踢连接（broker 端 client id 冲突）。已加 `tauri-plugin-single-instance`，桌面右键/快速操作二次启动会转发 `--history` 给已运行实例。排查时注意别同时跑 `pnpm tauri dev` 和手动启动的二进制。
 - **防回环三道闸**：消息带 `deviceId`（自己的忽略）→ 收到远端先更新 `last_clip` 再写剪贴板 → 监听线程发现内容等于 `last_clip` 不再发布/记录。前端点击复制走 `clipboard::copy` 但**不**更新 `last_clip`（由监听线程当新复制发布，保持点击复制也能跨端同步）。
 - **监听线程的 TOCTOU 竞态会把过期内容发出去（回流）**：「读剪贴板快照 → 查 `last_clip` → 发布」不是原子的，期间收到新消息改掉 `last_clip` 后，过期快照会被当新复制发布回对端，~700ms 后回流覆盖对端刚同步到的新内容（表象就是"收到 mq 但剪贴板没变"）。已用 `SyncState::with_clip_gate` 把监听线程决策与消息处理线程「更新基准→写剪贴板」互斥，并用 `recent_sent`（5 秒窗口）忽略回流的本机内容。改这段逻辑时必须保持「先拿闸门、再拿内部锁」的加锁顺序。
 - **macOS `NSPasteboard` 写入会静默失败**：与其它进程（用户复制、pbcopy、其它 app）并发时 `writeObjects` 间歇性返回 false（alacritty 有大量同类 issue），且 arboard 是 `clearContents` + `writeContents` 两步，失败会丢内容。所以写剪贴板统一走 `clipboard::write_text_verified`（写后读回校验 + 退避重试 4 次），成功/竞争/失败都如实记日志；禁止 `let _ = write_text` 吞错误。
 - **MQTT 收包与处理解耦**：收到的消息只入内存队列（`SyncState::enqueue_incoming`，容量 512 满则丢弃记 WARN），由 `mqtt-message-worker` 单线程顺序消费（解析 → 记历史 → 写剪贴板），不在 MQTT 事件循环里做剪贴板/历史 IO，同时保证处理顺序。
-- **`arboard` 读剪贴板返回 Err 是常态**（剪贴板里是图片/文件时），直接 `continue` 忽略；监听线程 700ms 轮询。
+- **`arboard` 读剪贴板返回 Err 是常态**（剪贴板里是图片/文件时），直接 `continue` 忽略；监听线程 700ms 轮询（读入口 `clipboard::read_text()`，与写入共用自持单例，访问全部串行化）。
 - **桌面右键集成条目表**（`shell_integration.rs` 的 `ENTRIES`）：当前两条——剪贴板历史 `--history`、文件中转站 `--files`，设置页开关统一安装 / 卸载。macOS workflow 装在 `~/Library/Services/DeskTools <条目名>.workflow`（bundle id 按条目区分），首次可能需在「系统设置 → 键盘 → 快捷键 → 服务」启用；`pbs -update` 刷新缓存。Windows 注册表项在 `HKCU\Software\Classes\Directory\Background\shell\DeskTools<History|FileHub>`。旧版本只装过主条目，release 启动时 `sync_on_startup()` 自动补装新条目（debug 构建跳过，避免指向 target/debug 二进制）。
 - **配置/历史/日志位置**：`~/Library/Application Support/com.hyy.desktools/`（config.json、history.json），日志在 `~/Library/Logs/com.hyy.desktools/desktools.jsonl`；Windows 在 `%APPDATA%` / `%LOCALAPPDATA%` 对应目录。排查问题可直接删 config.json 重置。
 - **开机自启由 `autostart` 模块统一管理**：`config.json` 的 `autoStart` 是唯一「意图」来源，release 构建启动时只在与系统状态不一致时才写系统（一致时不重写 `~/Library/LaunchAgents/desktools.plist`，否则每次启动都会触发 macOS BTM 重新注册后台项、通知配额被耗尽）；**debug 构建跳过**，防止自启条目被指向 `target/debug` 二进制。设置页开关经 `get_autostart_state` / `set_autostart` 读写（不再直接调 plugin JS API）；`save_mqtt_config` 保存整份表单时会保留已持久化的 `autoStart`，不会被前端旧值覆盖。
@@ -165,6 +165,6 @@ src-tauri/
 - **rust-s3 0.38 的几个坑**（file_hub.rs 已处理）：① `list_page` / `delete_object` / `head_object` 都用 `response_data(false)`，HTTP 4xx 不会返回 Err（`fail-on-err` 对它们无效）——列举失败靠 XML 解析错误体现，删除后要自己检查 `status_code()`；② 建桶用 `Bucket::create_with_path_style`，成功与否看返回的 `response_code`（200 成功 / 409 已存在），非 200 不会 Err；③ MinIO 必须 path-style（`with_path_style()`）；region 用 `Region::Custom{region:"us-east-1"}`，MinIO 未配置 region 时 `parseLocationConstraint` 放行任意 LocationConstraint；④ `put_object_stream` 按 8MiB 阈值自动在单次 PUT / 分片上传间切换，读写全程流式不进内存；⑤ multipart 时本地读取进度可能先到 100%，前端进度条封顶 99% 直到 `done` 事件。
 - **文件中转站真实联调**：`src-tauri` 下 `DESKTOOLS_MINIO_HOST=127.0.0.1:9000 DESKTOOLS_MINIO_KEY=xx DESKTOOLS_MINIO_SECRET=yy cargo test file_hub::tests::e2e_minio_roundtrip -- --ignored --nocapture`（可加 `DESKTOOLS_MINIO_BUCKET=xxx` 换桶；会建桶、上传、GET 校验、删除，用小文件）。文件对话框需 `tauri-plugin-dialog`（Rust 插件 + npm 包 + capability `dialog:default`，且窗口 label 必须在该 capability 的 `windows` 列表里）。
 - **Tauri v2 的 ACL 只拦 `plugin:` 命令**：`tauri` 源码（`src/webview/mod.rs`）里只有当请求是插件命令（含 `core:*`，如 `core:event|listen`）或应用自带 ACL manifest 或来自远程 origin 时才校验 capability；自定义命令（`generate_handler!` 注册的）默认不受 ACL 限制。窗口 label 不在任何 capability 的 `windows` 列表时，它的 `listen` / dialog / opener 等插件命令全部被拒（release 报 "Command plugin:xxx not allowed by ACL"，debug 有更详细的 `resolve_access_message`）。历史小窗口曾因为没进 `windows` 列表静默收不到 `history://refresh`（listen 失败被 try/catch 吞了，表象是「右键打开不是最新数据」）；修复后仍保留前端 `window` focus 兜底刷新（HistoryPage / FileHubPage compact）双保险。新增窗口（如 files）后必须把 label 加进 `capabilities/default.json`（core/opener）和所需插件权限文件（dialog 等）。
-- **拖拽上传与剪贴板图片上传**（FileHubPage / file_hub.rs）：窗口 `dragDropEnabled` 默认 `true`（原生接管文件拖放，会禁用 webview 的 HTML5 dnd），前端用 `getCurrentWindow().onDragDropEvent`（底层是 `core:event|listen`，窗口需在 capability `windows` 列表里）拿 `enter/over/drop/leave` + 文件路径。剪贴板图片在 Rust 侧用 `tauri_plugin_clipboard_manager::ClipboardExt::read_image` 读取（插件 ACL 只约束 webview IPC，Rust 侧调用不受限），RGBA 数据在 `spawn_blocking` 里用 `png` crate 编码为 PNG 再走 `put_object_stream_with_content_type` 上传（图片小、不发进度事件）；前端 Ctrl+V 只在剪贴板没有文本时接管，避免拦截正常粘贴。
+- **拖拽上传与剪贴板图片上传**（FileHubPage / file_hub.rs）：窗口 `dragDropEnabled` 默认 `true`（原生接管文件拖放，会禁用 webview 的 HTML5 dnd），前端用 `getCurrentWindow().onDragDropEvent`（底层是 `core:event|listen`，窗口需在 capability `windows` 列表里）拿 `enter/over/drop/leave` + 文件路径。剪贴板图片在 Rust 侧用 `clipboard::read_image()` 读取（自持 arboard 实例，arboard 需启用 `image-data` feature），RGBA 数据在 `spawn_blocking` 里用 `png` crate 编码为 PNG 再走 `put_object_stream_with_content_type` 上传（图片小、不发进度事件）；前端 Ctrl+V 只在剪贴板没有文本时接管，避免拦截正常粘贴。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

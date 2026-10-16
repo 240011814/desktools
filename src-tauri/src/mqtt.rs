@@ -315,7 +315,7 @@ fn process_incoming(app: &AppHandle, raw: &str) {
         // 写剪贴板（读回校验 + 竞争重试），结果如实记日志
         let chars = text.chars().count();
         let preview = logger::preview(&text);
-        match clipboard::write_text_verified(app, &text) {
+        match clipboard::write_text_verified(&text) {
             Ok(1) => logger::log(app, INFO, format!("收到远端内容，已写入剪贴板（{chars} 字符）：{preview}")),
             Ok(attempts) => logger::log(
                 app,
@@ -358,21 +358,19 @@ fn current_device_id(app: &AppHandle) -> String {
 /// 监听本机剪贴板变化，每次复制文本后发布到 texthub/<group>
 #[cfg(desktop)]
 pub fn spawn_clipboard_watcher(app: AppHandle) {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-
     let _ = std::thread::Builder::new()
         .name("clipboard-watcher".into())
         .spawn(move || {
             let last_clip = app.state::<SyncState>().last_clip.clone();
             // 启动时的剪贴板内容作为基准：不记录、不对外发送
-            let mut last_seen = app.clipboard().read_text().unwrap_or_default();
+            let mut last_seen = clipboard::read_text().unwrap_or_default();
             *last_clip.lock().unwrap() = last_seen.clone();
             loop {
                 std::thread::sleep(Duration::from_millis(700));
                 // 整段决策放在剪贴板闸门内：与消息处理线程的「更新基准 → 写剪贴板」互斥，
                 // 防止读到的过期快照被当成新复制发布出去（回流的旧内容会覆盖对端刚同步的新内容）
                 app.state::<SyncState>().with_clip_gate(|| {
-                    let text = match app.clipboard().read_text() {
+                    let text = match clipboard::read_text() {
                         Ok(text) => text,
                         Err(_) => return, // 剪贴板里不是文本，忽略
                     };

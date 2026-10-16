@@ -1,8 +1,68 @@
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
 
 use crate::logger;
+
+/// 全局剪贴板实例（进程内单例，所有线程共用）。
+///
+/// 不走 `tauri-plugin-clipboard-manager`：该插件按 arboard 建议在 `RunEvent::Exit`
+/// 时 `take()` 掉内部实例（`cleanup()`），之后任何并发调用（700ms 轮询的剪贴板
+/// 监听线程、消息处理线程写剪贴板等）都会命中插件内部的 `.as_mut().unwrap()` 并
+/// panic；release 构建 `panic = "abort"`，表现为退出瞬间 SIGABRT 崩溃
+/// （1.0.14 崩溃报告实证：崩溃线程 clipboard-watcher，主线程正卡在退出清理
+/// `NSStatusBar _removeStatusItem`）。自持实例退出前不做 take，由进程统一回收，
+/// 从结构上消除这个竞态窗口。
+#[cfg(desktop)]
+static CLIPBOARD: OnceLock<Mutex<arboard::Clipboard>> = OnceLock::new();
+
+/// 在全局实例上执行一次剪贴板操作（串行化所有线程的访问；错误统一转 String）
+#[cfg(desktop)]
+fn with_clipboard<R>(
+    op: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
+) -> Result<R, String> {
+    if CLIPBOARD.get().is_none() {
+        let clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("初始化剪贴板失败：{e}"))?;
+        let _ = CLIPBOARD.set(Mutex::new(clipboard));
+    }
+    let mutex = CLIPBOARD
+        .get()
+        .ok_or_else(|| "初始化剪贴板失败".to_string())?;
+    let mut clipboard = mutex.lock().unwrap();
+    op(&mut clipboard).map_err(|e| e.to_string())
+}
+
+/// 读取剪贴板文本（监听线程轮询用；剪贴板里不是文本时返回 Err，调用方忽略）
+pub fn read_text() -> Result<String, String> {
+    #[cfg(desktop)]
+    {
+        with_clipboard(|clipboard| clipboard.get_text())
+    }
+    #[cfg(not(desktop))]
+    {
+        Err("当前平台不支持剪贴板操作".into())
+    }
+}
+
+/// 读取剪贴板图片，返回 (宽, 高, RGBA8 原始数据)（文件中转站「粘贴图片」用）
+pub fn read_image() -> Result<(u32, u32, Vec<u8>), String> {
+    #[cfg(desktop)]
+    {
+        with_clipboard(|clipboard| clipboard.get_image()).map(|image| {
+            (
+                image.width as u32,
+                image.height as u32,
+                image.bytes.into_owned(),
+            )
+        })
+    }
+    #[cfg(not(desktop))]
+    {
+        Err("当前平台不支持剪贴板操作".into())
+    }
+}
 
 /// 写入剪贴板并读回校验，失败自动重试。
 ///
@@ -11,21 +71,20 @@ use crate::logger;
 /// 因此写入后读回比对，不一致则退避重试，保证远端内容最终落到剪贴板。
 ///
 /// 返回成功时的尝试次数（>1 说明发生过竞争，可写日志观察）。
-pub fn write_text_verified(app: &AppHandle, text: &str) -> Result<u32, String> {
+pub fn write_text_verified(text: &str) -> Result<u32, String> {
     #[cfg(desktop)]
     {
-        use tauri_plugin_clipboard_manager::ClipboardExt;
         write_with_retry(
             text,
-            || app.clipboard().write_text(text).map_err(|e| e.to_string()),
-            || app.clipboard().read_text().map_err(|e| e.to_string()),
+            || with_clipboard(|clipboard| clipboard.set_text(text)),
+            || with_clipboard(|clipboard| clipboard.get_text()),
             4,
             60,
         )
     }
     #[cfg(not(desktop))]
     {
-        let _ = (app, text);
+        let _ = text;
         Err("当前平台不支持剪贴板操作".into())
     }
 }
@@ -36,7 +95,7 @@ pub fn write_text_verified(app: &AppHandle, text: &str) -> Result<u32, String> {
 pub fn copy(app: &AppHandle, text: &str) -> Result<u32, String> {
     let attempts = app
         .state::<crate::mqtt::SyncState>()
-        .with_clip_gate(|| write_text_verified(app, text))?;
+        .with_clip_gate(|| write_text_verified(text))?;
     logger::log(
         app,
         logger::INFO,

@@ -931,6 +931,7 @@ dependencies = [
 name = "desktools"
 version = "1.0.0"
 dependencies = [
+ "arboard",
  "base64 0.22.1",
  "libc",
  "machine-uid",
@@ -943,7 +944,6 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
- "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-plugin-os",
@@ -4638,21 +4638,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bce56ceb0a99b8ab5eebc977ba9ffc62391b862648cb9ab76fc8bc7231b8f7e2"
 dependencies = [
  "auto-launch",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "tauri-plugin-clipboard-manager"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "640d0789c9db02265a800fded60520df5a3baa4a1b5f40715b83d58842c24fcb"
-dependencies = [
- "arboard",
- "log",
  "serde",
  "serde_json",
  "tauri",
