@@ -85,6 +85,7 @@ desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS 
 
 - **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
 - **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
+- **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件，固定使用 bucket `hub`（不存在时自动创建）；服务器地址、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
 - **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。**启动时做锁屏能力自检**（SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），结果记日志并在设置页展示。
 - **系统集成**：桌面右键菜单弹出历史小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow）；托盘右键菜单含「剪贴板历史 / 显示主窗口 / 退出」。
@@ -119,16 +120,19 @@ src/                          # Vue 3 前端
   styles.css                  # 全局设计变量（深浅色自适应）与通用组件样式（卡片/按钮/表单/开关/徽章/空状态）
   components/
     HistoryPage.vue           # 剪贴板历史（compact 属性 = 小窗口紧凑布局）
+    FileHubPage.vue           # 文件中转站（MinIO 上传 / 下载 / 删除 + 传输进度）
     LogPage.vue               # 运行日志（级别筛选 / 刷新 / 清空）
     UpdatePage.vue            # 软件更新检测与安装
-    SettingsPage.vue          # 系统设置：MQTT 同步配置 + 桌面右键集成 + 开机自启
+    SettingsPage.vue          # 系统设置：MQTT 同步配置 + 文件中转站（MinIO）+ 桌面右键集成 + 开机自启
 src-tauri/
   src/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --hidden）
     auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）+ 锁屏能力自检
     autostart.rs              # 开机自启：config.json 的 autoStart 意图持久化 + 启动时与系统状态对齐（dev 构建跳过）
     clipboard.rs              # 写剪贴板统一入口（写后读回校验 + 竞争重试），copy_to_clipboard 共用
-    config.rs                 # MqttConfig 持久化（config.json）与校验
+    config.rs                 # MqttConfig / MinioConfig 持久化（config.json）与校验、MinIO 地址容错解析
+    file_hub.rs               # 文件中转站：MinIO 上传 / 下载 / 删除（rust-s3，bucket hub，进度事件 filehub://progress）
+    secret.rs                 # 本地凭据加密：机器绑定 HKDF-SHA256 + AES-256-GCM（enc:v1: 格式）
     mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）；收包只入队，后台单线程消费
     history.rs                # 剪贴板历史（200 条上限、去重置顶、history.json）
     logger.rs                 # 运行日志（内存 + JSONL 轮转，preview() 截断长文本）
@@ -140,7 +144,7 @@ src-tauri/
 ## 代码规范
 
 - **前端**：Vue 3 `<script setup lang="ts">`；共享状态放 `src/store.ts`（ref + 接口），页面组件放 `src/components/`；通用样式写 `styles.css` 全局类（`.card` `.btn` `.switch` `.hint` `.empty` 等），组件只写 `scoped` 差异样式；与 Rust 通信用 `invoke`（命令）与 `listen`（事件），全部包 try/catch 保证浏览器预览不报错。
-- **后端**：每个领域一个模块（config / mqtt / history / logger / shell_integration）；命令集中在 `lib.rs` 注册；事件名形如 `mqtt://status`、`history://changed`、`log://changed`；serde 统一 `#[serde(rename_all = "camelCase")]`，前端接口与之对应。
+- **后端**：每个领域一个模块（config / mqtt / history / logger / shell_integration / file_hub / secret）；命令集中在 `lib.rs` 注册；事件名形如 `mqtt://status`、`history://changed`、`log://changed`、`filehub://progress`；serde 统一 `#[serde(rename_all = "camelCase")]`，前端接口与之对应。
 - **测试**：纯逻辑（校验、去重、轮转、消息解析）写单元测试，触碰系统（AppHandle / 文件 / 注册表）的逻辑抽成可注入路径的纯函数再测。
 
 ## 开发经验 / 注意事项
@@ -157,5 +161,8 @@ src-tauri/
 - **开机自启由 `autostart` 模块统一管理**：`config.json` 的 `autoStart` 是唯一「意图」来源，release 构建启动时只在与系统状态不一致时才写系统（一致时不重写 `~/Library/LaunchAgents/desktools.plist`，否则每次启动都会触发 macOS BTM 重新注册后台项、通知配额被耗尽）；**debug 构建跳过**，防止自启条目被指向 `target/debug` 二进制。设置页开关经 `get_autostart_state` / `set_autostart` 读写（不再直接调 plugin JS API）；`save_mqtt_config` 保存整份表单时会保留已持久化的 `autoStart`，不会被前端旧值覆盖。
 - **锁屏能力自检**：启动时 `auto_lock::self_check()` 非破坏性探测（dlopen/dlsym `SACLockScreenImmediate`、`AXIsProcessTrusted`、`AEDeterminePermissionToAutomateTarget` 以 `askUserIfNeeded=false` 静默查询、`sysadminctl -screenLock status` 读「进入睡眠后需要密码」），结果记日志并经 `get_lock_capability` 在设置页「离人自动锁屏」卡片展示；运行中锁屏降级时逐级记 WARN（能看到 Ctrl+Cmd+Q 失败的具体原因）。
 - **Tauri 类实例不能进深度响应式**：`Update`（`@tauri-apps/plugin-updater`）等继承 `Resource` 的类带 `#` 私有字段，放进 Vue `ref()` 被 Proxy 代理后调用方法会报 `TypeError: Cannot read private member from an object whose class did not declare it`（Windows/macOS 同病）。必须用 `shallowRef` 或 `markRaw` 保存类实例；纯数据对象则无此问题。
+- **MinIO 凭据加密只发生在写盘/读盘**：`secret.rs` 用机器绑定密钥（HKDF-SHA256：ikm=机器码，machine-uid 读不到时退回 hostname；salt=`com.hyy.desktools`，info=`minio-credentials`）+ AES-256-GCM，密文格式 `enc:v1:<base64(nonce‖ciphertext‖tag)>`；`MqttConfig::save()` 加密、`load()` 解密（无前缀按历史明文透传，解密失败按空串 = 换机器后重填）。**不要**给字段加 serde `serialize_with/deserialize_with` 加密属性——那样 `get_mqtt_config` 返回给前端的也会是密文，必须在 save/load 这一层做。tests 用 `minio_credentials_are_encrypted_in_file` / `minio_credentials_stay_plaintext_in_memory_serialization` 双向守住这个边界。
+- **rust-s3 0.38 的几个坑**（file_hub.rs 已处理）：① `list_page` / `delete_object` / `head_object` 都用 `response_data(false)`，HTTP 4xx 不会返回 Err（`fail-on-err` 对它们无效）——列举失败靠 XML 解析错误体现，删除后要自己检查 `status_code()`；② 建桶用 `Bucket::create_with_path_style`，成功与否看返回的 `response_code`（200 成功 / 409 已存在），非 200 不会 Err；③ MinIO 必须 path-style（`with_path_style()`）；region 用 `Region::Custom{region:"us-east-1"}`，MinIO 未配置 region 时 `parseLocationConstraint` 放行任意 LocationConstraint；④ `put_object_stream` 按 8MiB 阈值自动在单次 PUT / 分片上传间切换，读写全程流式不进内存；⑤ multipart 时本地读取进度可能先到 100%，前端进度条封顶 99% 直到 `done` 事件。
+- **文件中转站真实联调**：`src-tauri` 下 `DESKTOOLS_MINIO_HOST=127.0.0.1:9000 DESKTOOLS_MINIO_KEY=xx DESKTOOLS_MINIO_SECRET=yy cargo test file_hub::tests::e2e_minio_roundtrip -- --ignored --nocapture`（会建桶、上传、GET 校验、删除，用小文件）。文件对话框需 `tauri-plugin-dialog`（Rust 插件 + npm 包 + capability `dialog:default` 三处）。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

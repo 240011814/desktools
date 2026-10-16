@@ -20,14 +20,21 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-os = "2"
 tauri-plugin-process = "2"
 rumqttc = "0.25"
-tokio = { version = "1", features = ["time"] }
+# 文件中转站：S3 兼容客户端（TLS 复用依赖树里已有的 rustls + ring）
+rust-s3 = { version = "0.38", default-features = false, features = ["tokio-rustls-tls-ring", "fail-on-err"] }
+tokio = { version = "1", features = ["time", "fs", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
+# 配置文件中 MinIO 凭据的机器绑定加密（HKDF-SHA256 + AES-256-GCM）
+ring = "0.17"
+base64 = "0.22"
+machine-uid = "0.6"
 # macOS 系统锁屏接口（SACLockScreenImmediate）dlopen 用
 libc = "0.2"
 
@@ -46,3 +53,7 @@ strip = true
 tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+# 测试用（file_hub 的 #[tokio::test]）
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

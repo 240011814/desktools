@@ -2,6 +2,16 @@ import { ref } from "vue";
 
 /* 侧边栏与各页面共享的状态与类型 */
 
+/** 文件中转站（MinIO）配置；Access Key / Secret Key 本地加密存储 */
+export interface MinioConfig {
+  /** 服务器地址（主机名 / IP，也兼容粘贴 http://ip:9000 形式） */
+  host: string;
+  port: number;
+  tls: boolean;
+  accessKey: string;
+  secretKey: string;
+}
+
 export interface MqttConfig {
   host: string;
   port: number;
@@ -16,6 +26,8 @@ export interface MqttConfig {
   autoLockDelaySecs: number;
   /** 开机自动启动（持久化意图；由应用启动时与系统实际状态对齐） */
   autoStart: boolean;
+  /** 文件中转站（MinIO）配置 */
+  minio: MinioConfig;
 }
 
 export type MqttState = "idle" | "connecting" | "connected" | "reconnecting" | "error";

@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { platform } from "@tauri-apps/plugin-os";
-import { mqttStatus, type MqttConfig } from "../store";
+import { mqttStatus, type MqttConfig, type MinioConfig } from "../store";
 
 /* ---------------- 开机自启 ---------------- */
 interface AutostartState {
@@ -58,6 +58,7 @@ const form = reactive<MqttConfig>({
   autoLock: false,
   autoLockDelaySecs: 5,
   autoStart: true,
+  minio: { host: "", port: 9000, tls: false, accessKey: "", secretKey: "" },
 });
 
 const saving = ref(false);
@@ -91,6 +92,49 @@ async function saveConfig() {
     configError.value = String(e);
   } finally {
     saving.value = false;
+  }
+}
+
+/* ---------------- 文件中转站（MinIO） ---------------- */
+const minioBusy = ref(false);
+const minioTesting = ref(false);
+const minioError = ref("");
+const minioSaved = ref("");
+
+async function saveMinioConfig() {
+  if (minioBusy.value) return;
+  minioBusy.value = true;
+  minioError.value = "";
+  minioSaved.value = "";
+  try {
+    form.minio.port = Math.min(65535, Math.max(1, Number(form.minio.port) || 9000));
+    const saved = await invoke<MinioConfig>("save_minio_config", {
+      minio: { ...form.minio },
+    });
+    form.minio = saved;
+    minioSaved.value = saved.host ? "MinIO 配置已保存" : "MinIO 配置已清除";
+    setTimeout(() => (minioSaved.value = ""), 4000);
+  } catch (e) {
+    minioError.value = String(e);
+  } finally {
+    minioBusy.value = false;
+  }
+}
+
+async function testMinioConnection() {
+  if (minioTesting.value) return;
+  minioTesting.value = true;
+  minioError.value = "";
+  minioSaved.value = "";
+  try {
+    minioSaved.value = await invoke<string>("minio_test_connection", {
+      minio: { ...form.minio },
+    });
+    setTimeout(() => (minioSaved.value = ""), 6000);
+  } catch (e) {
+    minioError.value = String(e);
+  } finally {
+    minioTesting.value = false;
   }
 }
 
@@ -297,6 +341,75 @@ onMounted(() => {
       <p v-else class="hint">
         本机每次复制的文本会发布到 {{ topicPreview }}，收到其他设备的内容自动写入剪贴板，
         两者都会记入「剪贴板历史」。
+      </p>
+    </section>
+
+    <!-- 文件中转站（MinIO） -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>文件中转站（MinIO）</h2>
+          <p class="card-sub">S3 兼容存储；文件放在固定 bucket「hub」中（不存在时自动创建）</p>
+        </div>
+      </div>
+
+      <form class="form-grid" @submit.prevent="saveMinioConfig">
+        <label class="field span-2">
+          <span>服务器地址</span>
+          <input
+            v-model.trim="form.minio.host"
+            type="text"
+            placeholder="例如 192.168.1.5 或直接粘贴 http://192.168.1.5:9000"
+            spellcheck="false"
+          />
+        </label>
+        <label class="field">
+          <span>端口</span>
+          <input v-model.number="form.minio.port" type="number" min="1" max="65535" placeholder="9000" />
+        </label>
+        <label class="field">
+          <span>Access Key</span>
+          <input
+            v-model.trim="form.minio.accessKey"
+            type="text"
+            placeholder="MinIO 访问密钥"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <label class="field span-2">
+          <span>Secret Key</span>
+          <input
+            v-model="form.minio.secretKey"
+            type="password"
+            placeholder="••••••••"
+            autocomplete="new-password"
+          />
+        </label>
+
+        <div class="form-foot span-2">
+          <label class="switch">
+            <input v-model="form.minio.tls" type="checkbox" />
+            <span class="track"><span class="thumb"></span></span>
+            <span class="switch-text">TLS（https）</span>
+          </label>
+          <div class="actions">
+            <button type="button" :disabled="minioTesting || minioBusy" @click="testMinioConnection">
+              {{ minioTesting ? "测试中…" : "测试连接" }}
+            </button>
+            <button class="primary" type="submit" :disabled="minioBusy">
+              {{ minioBusy ? "保存中…" : "保存" }}
+            </button>
+          </div>
+        </div>
+      </form>
+
+      <p v-if="minioError" class="hint err">{{ minioError }}</p>
+      <p v-else-if="minioSaved" class="hint ok">{{ minioSaved }}</p>
+      <p v-else class="hint">
+        Access Key / Secret Key 以机器绑定加密后存本机（配置文件中不落明文），
+        更换电脑或重装系统后需要重新填写；地址留空保存 = 清除配置。
+        「测试连接」用当前表单值验证，不影响已保存的配置。
       </p>
     </section>
 

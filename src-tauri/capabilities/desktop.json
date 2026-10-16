@@ -10,6 +10,7 @@
   ],
   "permissions": [
     "opener:default",
+    "dialog:default",
     "process:default",
     "autostart:default",
     "clipboard-manager:allow-read-text",

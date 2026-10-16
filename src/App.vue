@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import HistoryPage from "./components/HistoryPage.vue";
+import FileHubPage from "./components/FileHubPage.vue";
 import LogPage from "./components/LogPage.vue";
 import UpdatePage from "./components/UpdatePage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
@@ -17,6 +18,8 @@ const ICONS: Record<string, string> = {
   history:
     '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/>',
   log: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/>',
+  files:
+    '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 16v-5.5"/><path d="m9.5 12.5 2.5-2.5 2.5 2.5"/>',
   update:
     '<path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3"/><path d="M7.5 10.5 12 15l4.5-4.5"/><path d="M12 15V4"/>',
   settings:
@@ -25,6 +28,7 @@ const ICONS: Record<string, string> = {
 
 const TABS = [
   { id: "history", label: "剪贴板历史", icon: "history" },
+  { id: "files", label: "文件中转站", icon: "files" },
   { id: "log", label: "日志", icon: "log" },
   { id: "update", label: "软件更新", icon: "update" },
   { id: "settings", label: "系统设置", icon: "settings" },
@@ -34,6 +38,7 @@ type TabId = (typeof TABS)[number]["id"];
 
 const pages: Record<TabId, unknown> = {
   history: HistoryPage,
+  files: FileHubPage,
   log: LogPage,
   update: UpdatePage,
   settings: SettingsPage,

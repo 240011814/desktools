@@ -6,12 +6,14 @@ mod auto_lock;
 mod autostart;
 mod clipboard;
 mod config;
+mod file_hub;
 mod history;
 mod logger;
 mod mqtt;
+mod secret;
 mod shell_integration;
 
-use config::MqttConfig;
+use config::{MinioConfig, MqttConfig};
 use history::{HistoryItem, HistoryState};
 use logger::{LogEntry, LogState};
 use mqtt::{MqttStatus, SyncState};
@@ -51,8 +53,14 @@ fn save_mqtt_config(app: tauri::AppHandle, mut cfg: MqttConfig) -> Result<MqttCo
     cfg.host = cfg.host.trim().to_string();
     cfg.group = cfg.group.trim().to_string();
     cfg.username = cfg.username.trim().to_string();
-    // 开机自启由 set_autostart 专管：整份表单保存时保留已持久化意图，避免被前端旧值覆盖
-    cfg.auto_start = app.state::<SyncState>().config.lock().unwrap().auto_start;
+    // 开机自启由 set_autostart、MinIO 由 save_minio_config 各自专管：
+    // 整份表单保存时保留已持久化值，避免被前端旧值覆盖
+    {
+        let state = app.state::<SyncState>();
+        let persisted = state.config.lock().unwrap().clone();
+        cfg.auto_start = persisted.auto_start;
+        cfg.minio = persisted.minio;
+    }
     cfg.validate()?;
 
     let path = config::config_path(&app);
@@ -152,6 +160,184 @@ fn get_lock_capability() -> auto_lock::LockReport {
     auto_lock::self_check()
 }
 
+/// 从当前内存配置中取 MinIO 配置
+fn current_minio(app: &tauri::AppHandle) -> MinioConfig {
+    app.state::<SyncState>().config.lock().unwrap().minio.clone()
+}
+
+/// 保存 MinIO 配置（host 留空 = 清除配置；凭据写盘时机器绑定加密）
+#[tauri::command]
+fn save_minio_config(app: tauri::AppHandle, minio: MinioConfig) -> Result<MinioConfig, String> {
+    let saved = if minio.configured() {
+        let normalized = minio.normalized();
+        normalized.validate()?;
+        normalized
+    } else {
+        MinioConfig::default()
+    };
+
+    {
+        let state = app.state::<SyncState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.minio = saved.clone();
+        cfg.save(&config::config_path(&app))?;
+    }
+
+    logger::log(
+        &app,
+        logger::INFO,
+        if saved.configured() {
+            format!(
+                "文件中转站：MinIO 配置已保存（{}:{}，TLS {}）",
+                saved.host,
+                saved.port,
+                if saved.tls { "开" } else { "关" }
+            )
+        } else {
+            "文件中转站：MinIO 配置已清除".to_string()
+        },
+    );
+    Ok(saved)
+}
+
+/// 测试 MinIO 连接（直接用表单里的值测，保存前即可验证）：连接成功且 bucket 可用时返回一句话结果
+#[tauri::command]
+async fn minio_test_connection(
+    app: tauri::AppHandle,
+    minio: MinioConfig,
+) -> Result<String, String> {
+    let cfg = minio.normalized();
+    if !cfg.configured() {
+        return Err("请先填写 MinIO 服务器地址".into());
+    }
+    cfg.validate()?;
+    let started = std::time::Instant::now();
+    match file_hub::test_connection(&app, &cfg).await {
+        Ok(message) => {
+            logger::log(
+                &app,
+                logger::INFO,
+                format!("文件中转站：{message}（{} ms）", started.elapsed().as_millis()),
+            );
+            Ok(message)
+        }
+        Err(err) => {
+            logger::log(&app, logger::WARN, format!("文件中转站：测试连接失败：{err}"));
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+async fn file_hub_list(app: tauri::AppHandle) -> Result<Vec<file_hub::HubFile>, String> {
+    let cfg = current_minio(&app);
+    let started = std::time::Instant::now();
+    match file_hub::list(&app, &cfg).await {
+        Ok(files) => {
+            logger::log(
+                &app,
+                logger::INFO,
+                format!(
+                    "文件中转站：已加载 {} 个文件（{} ms）",
+                    files.len(),
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(files)
+        }
+        Err(err) => {
+            logger::log(
+                &app,
+                logger::WARN,
+                format!("文件中转站：加载文件列表失败：{err}"),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+async fn file_hub_upload(
+    app: tauri::AppHandle,
+    path: String,
+    transfer_id: String,
+) -> Result<String, String> {
+    let cfg = current_minio(&app);
+    let started = std::time::Instant::now();
+    match file_hub::upload(&app, &cfg, &path, &transfer_id).await {
+        Ok(key) => {
+            logger::log(
+                &app,
+                logger::INFO,
+                format!(
+                    "文件中转站：上传完成 {key}（{} ms）",
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(key)
+        }
+        Err(err) => {
+            logger::log(
+                &app,
+                logger::ERROR,
+                format!("文件中转站：上传失败（{path}）：{err}"),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+async fn file_hub_download(
+    app: tauri::AppHandle,
+    key: String,
+    target_path: String,
+    transfer_id: String,
+) -> Result<(), String> {
+    let cfg = current_minio(&app);
+    let started = std::time::Instant::now();
+    match file_hub::download(&app, &cfg, &key, &target_path, &transfer_id).await {
+        Ok(()) => {
+            logger::log(
+                &app,
+                logger::INFO,
+                format!(
+                    "文件中转站：下载完成 {key} → {target_path}（{} ms）",
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(())
+        }
+        Err(err) => {
+            logger::log(
+                &app,
+                logger::ERROR,
+                format!("文件中转站：下载失败（{key}）：{err}"),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+async fn file_hub_delete(app: tauri::AppHandle, key: String) -> Result<(), String> {
+    let cfg = current_minio(&app);
+    match file_hub::delete(&app, &cfg, &key).await {
+        Ok(()) => {
+            logger::log(&app, logger::INFO, format!("文件中转站：已删除 {key}"));
+            Ok(())
+        }
+        Err(err) => {
+            logger::log(
+                &app,
+                logger::ERROR,
+                format!("文件中转站：删除失败（{key}）：{err}"),
+            );
+            Err(err)
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -170,6 +356,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             get_mqtt_config,
@@ -185,7 +372,13 @@ pub fn run() {
             set_desktop_integration,
             get_autostart_state,
             set_autostart,
-            get_lock_capability
+            get_lock_capability,
+            save_minio_config,
+            minio_test_connection,
+            file_hub_list,
+            file_hub_upload,
+            file_hub_download,
+            file_hub_delete
         ])
         .setup(|app| {
             // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）

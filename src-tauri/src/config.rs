@@ -4,6 +4,109 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+use crate::secret;
+
+/// MinIO（文件中转站）配置
+///
+/// accessKey / secretKey 只在写盘时加密（见 `MqttConfig::save` / `load`，`enc:v1:` 前缀），
+/// 内存中与前端交互的始终是明文。host 留空表示未配置 / 已停用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MinioConfig {
+    /// 服务器地址（主机名 / IP；也兼容粘贴 `http://ip:9000` 形式，保存时规范化）
+    pub host: String,
+    /// 端口
+    pub port: u16,
+    /// 是否使用 TLS（https）
+    pub tls: bool,
+    /// Access Key
+    pub access_key: String,
+    /// Secret Key
+    pub secret_key: String,
+}
+
+impl Default for MinioConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 9000,
+            tls: false,
+            access_key: String::new(),
+            secret_key: String::new(),
+        }
+    }
+}
+
+impl MinioConfig {
+    /// 是否已配置（host 为空视为未配置）
+    pub fn configured(&self) -> bool {
+        !self.host.trim().is_empty()
+    }
+
+    /// 规范化后的副本：地址容错解析、去除凭据首尾空白
+    pub fn normalized(&self) -> Self {
+        let (host, port, tls) = normalize_endpoint(&self.host, self.port, self.tls);
+        Self {
+            host,
+            port,
+            tls,
+            access_key: self.access_key.trim().to_string(),
+            secret_key: self.secret_key.trim().to_string(),
+        }
+    }
+
+    /// 校验（调用前应先 `normalized()`；host 为空代表清除配置，不在此校验）
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("端口必须在 1 ~ 65535 之间".into());
+        }
+        if self.access_key.is_empty() || self.secret_key.is_empty() {
+            return Err("请填写 Access Key 和 Secret Key".into());
+        }
+        Ok(())
+    }
+}
+
+/// 容错解析用户填写的 MinIO 服务器地址：
+/// 接受 `http://1.2.3.4:9000`、`https://host`、`host:9000`、`host`；
+/// scheme 存在时优先决定 tls；host 内显式端口优先于表单端口。
+pub fn normalize_endpoint(host: &str, port: u16, tls: bool) -> (String, u16, bool) {
+    let mut rest = host.trim();
+    let mut tls = tls;
+    if let Some(stripped) = rest.strip_prefix("https://") {
+        tls = true;
+        rest = stripped;
+    } else if let Some(stripped) = rest.strip_prefix("http://") {
+        tls = false;
+        rest = stripped;
+    }
+    let rest = rest.trim_end_matches('/');
+    let (host, parsed_port) = split_host_port(rest);
+    (host, parsed_port.unwrap_or(port), tls)
+}
+
+/// 拆分 `host:port` / `[IPv6]:port`；无端口或非数字端口时原样保留 host
+fn split_host_port(input: &str) -> (String, Option<u16>) {
+    let input = input.trim();
+    if let Some(rest) = input.strip_prefix('[') {
+        // IPv6 字面量：[::1]:9000 / [::1]（保留方括号，URL 里需要）
+        if let Some((addr, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (format!("[{addr}]"), port);
+        }
+        return (input.to_string(), None);
+    }
+    // 只有一个冒号才视为 host:port（无括号的 IPv6 地址原样保留）
+    if input.matches(':').count() == 1 {
+        if let Some((host, port)) = input.split_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    }
+    (input.to_string(), None)
+}
+
 /// MQTT 剪贴板同步配置（持久化到应用配置目录）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +134,9 @@ pub struct MqttConfig {
     /// 开机自动启动（持久化「意图」；应用启动时与系统实际状态对齐，见 autostart 模块）
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
+    /// 文件中转站（MinIO）配置
+    #[serde(default)]
+    pub minio: MinioConfig,
 }
 
 fn default_auto_lock_delay_secs() -> u64 {
@@ -54,6 +160,7 @@ impl Default for MqttConfig {
             auto_lock: false,
             auto_lock_delay_secs: default_auto_lock_delay_secs(),
             auto_start: default_auto_start(),
+            minio: MinioConfig::default(),
         }
     }
 }
@@ -73,6 +180,9 @@ impl MqttConfig {
         if config.device_id.trim().is_empty() {
             config.device_id = uuid::Uuid::new_v4().to_string();
         }
+        // MinIO 凭据落盘时加密：解密失败（换机器 / 文件被改）按空串处理，表现为需重新填写
+        config.minio.access_key = secret::decrypt(&config.minio.access_key).unwrap_or_default();
+        config.minio.secret_key = secret::decrypt(&config.minio.secret_key).unwrap_or_default();
         config
     }
 
@@ -80,8 +190,12 @@ impl MqttConfig {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
         }
+        // MinIO 凭据在写盘前加密（内存与前端接口保持明文）
+        let mut persisted = self.clone();
+        persisted.minio.access_key = secret::encrypt(&self.minio.access_key)?;
+        persisted.minio.secret_key = secret::encrypt(&self.minio.secret_key)?;
         let text =
-            serde_json::to_string_pretty(self).map_err(|e| format!("配置序列化失败：{e}"))?;
+            serde_json::to_string_pretty(&persisted).map_err(|e| format!("配置序列化失败：{e}"))?;
         fs::write(path, text).map_err(|e| format!("无法写入配置文件：{e}"))?;
         Ok(())
     }
@@ -194,5 +308,128 @@ mod tests {
         cfg.save(&path).unwrap();
         assert!(!MqttConfig::load(&path).auto_start);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_endpoint_accepts_common_formats() {
+        // 粘贴完整 URL：scheme 决定 tls，URL 内端口覆盖表单端口
+        assert_eq!(
+            normalize_endpoint("http://192.168.1.5:9000", 9000, true),
+            ("192.168.1.5".into(), 9000, false)
+        );
+        assert_eq!(
+            normalize_endpoint("https://minio.example.com", 9000, false),
+            ("minio.example.com".into(), 9000, true)
+        );
+        // 纯 host 原样保留；host:port 覆盖端口
+        assert_eq!(
+            normalize_endpoint("play.min.io", 9000, false),
+            ("play.min.io".into(), 9000, false)
+        );
+        assert_eq!(
+            normalize_endpoint("192.168.1.5:9010", 9000, false),
+            ("192.168.1.5".into(), 9010, false)
+        );
+        // 尾部斜杠、空格容错；IPv6 带方括号形式
+        assert_eq!(
+            normalize_endpoint(" minio.example.com/ ", 9000, false),
+            ("minio.example.com".into(), 9000, false)
+        );
+        assert_eq!(
+            normalize_endpoint("[::1]:9000", 9000, false),
+            ("[::1]".into(), 9000, false)
+        );
+    }
+
+    #[test]
+    fn minio_defaults_and_legacy_compat() {
+        // 旧版 config.json 没有 minio 字段：默认未配置，端口 9000
+        let legacy = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1"
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!cfg.minio.configured());
+        assert_eq!(cfg.minio.port, 9000);
+
+        // minio 内部字段缺失时应拿到默认端口（MinioConfig 容器级 default）
+        let partial = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1",
+            "minio": { "host": "minio.local" }
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(partial).unwrap();
+        assert!(cfg.minio.configured());
+        assert_eq!(cfg.minio.port, 9000);
+        assert!(!cfg.minio.tls);
+    }
+
+    #[test]
+    fn minio_credentials_are_encrypted_in_file() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.minio = MinioConfig {
+            host: "minio.local".into(),
+            port: 9000,
+            tls: false,
+            access_key: "AK-test-123".into(),
+            secret_key: "SK-test-456".into(),
+        };
+        cfg.save(&path).unwrap();
+
+        // 文件内容：明文凭据不能出现，密文带 enc:v1: 前缀
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("AK-test-123"));
+        assert!(!text.contains("SK-test-456"));
+        assert!(text.contains("enc:v1:"));
+
+        // 读回后恢复明文
+        let loaded = MqttConfig::load(&path);
+        assert_eq!(loaded.minio.access_key, "AK-test-123");
+        assert_eq!(loaded.minio.secret_key, "SK-test-456");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn minio_credentials_stay_plaintext_in_memory_serialization() {
+        // 前端接口（get_mqtt_config / save_mqtt_config 的返回值）走 serde 序列化：
+        // 必须拿到明文，加密只发生在写盘时（save）
+        let mut cfg = MqttConfig::default();
+        cfg.minio = MinioConfig {
+            host: "minio.local".into(),
+            port: 9000,
+            tls: false,
+            access_key: "AK-plain".into(),
+            secret_key: "SK-plain".into(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("AK-plain"));
+        assert!(json.contains("SK-plain"));
+        assert!(!json.contains("enc:v1:"));
+    }
+
+    #[test]
+    fn minio_validate_requires_credentials_and_port() {
+        let mut minio = MinioConfig {
+            host: "minio.local".into(),
+            ..MinioConfig::default()
+        };
+        assert!(minio.validate().is_err());
+        minio.access_key = " ak ".into();
+        minio.secret_key = " sk ".into();
+        assert!(minio.normalized().validate().is_ok());
+        minio.port = 0;
+        assert!(minio.validate().is_err());
     }
 }
