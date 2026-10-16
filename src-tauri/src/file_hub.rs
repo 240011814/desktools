@@ -211,6 +211,84 @@ pub async fn upload(
     }
 }
 
+/// 上传剪贴板中的图片（截图 / 复制图片后由前端「粘贴图片」触发）：PNG 编码后按 name_hint 作为 key 上传
+///
+/// 读取剪贴板与 PNG 编码都在 blocking 线程执行，避免大图编码阻塞异步运行时
+pub async fn upload_image(
+    app: &AppHandle,
+    cfg: &MinioConfig,
+    name_hint: &str,
+) -> Result<String, String> {
+    require_configured(cfg)?;
+    let key = clipboard_key(name_hint);
+    let app_owned = app.clone();
+    let png = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        let image = app_owned
+            .clipboard()
+            .read_image()
+            .map_err(|_| "剪贴板中没有图片（截图或复制图片后再试）".to_string())?;
+        encode_png_rgba(image.width(), image.height(), image.rgba())
+    })
+    .await
+    .map_err(|e| format!("读取剪贴板图片失败：{e}"))??;
+
+    let bucket = ensure_bucket(cfg, app).await?;
+    // &[u8] 自身实现 tokio 的 AsyncRead，可直接作为上传数据源（图片较小，不发进度事件）
+    let mut reader: &[u8] = &png;
+    let result = bucket
+        .put_object_stream_with_content_type(&mut reader, &key, "image/png")
+        .await;
+    match result {
+        Ok(resp) if resp.status_code() < 300 => Ok(key),
+        Ok(resp) => Err(format!("上传失败（HTTP {}）", resp.status_code())),
+        Err(err) => Err(format!("上传失败：{err}")),
+    }
+}
+
+/// RGBA8 像素编码为 PNG（纯函数，便于单测）
+fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 {
+        return Err("剪贴板图片尺寸无效".into());
+    }
+    if rgba.len() != width as usize * height as usize * 4 {
+        return Err("剪贴板图片数据不完整".into());
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("编码 PNG 失败：{e}"))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| format!("编码 PNG 失败：{e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("编码 PNG 失败：{e}"))?;
+    }
+    Ok(out)
+}
+
+/// 生成剪贴板图片的上传 key：只取建议名的文件名部分，为空时用时间戳兜底，确保 .png 后缀
+fn clipboard_key(name_hint: &str) -> String {
+    let name = name_hint.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if name.is_empty() {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        return format!("clipboard-{millis}.png");
+    }
+    if name.to_ascii_lowercase().ends_with(".png") {
+        name.to_string()
+    } else {
+        format!("{name}.png")
+    }
+}
+
 /// 下载文件到本地指定路径；失败时清理不完整的半成品文件
 pub async fn download(
     app: &AppHandle,
@@ -559,6 +637,40 @@ mod tests {
             guess_content_type("noext"),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn clipboard_key_sanitizes_name() {
+        assert_eq!(
+            clipboard_key("clipboard-20261016-153012.png"),
+            "clipboard-20261016-153012.png"
+        );
+        // 只取文件名部分（兼容 Windows 路径），缺失后缀时自动补 .png
+        assert_eq!(clipboard_key("a/b\\shot"), "shot.png");
+        assert_eq!(clipboard_key("SHOT.PNG"), "SHOT.PNG");
+        // 空白名用时间戳兜底
+        let fallback = clipboard_key("   ");
+        assert!(fallback.starts_with("clipboard-") && fallback.ends_with(".png"));
+    }
+
+    #[test]
+    fn png_encode_roundtrips() {
+        // 2x2：红 / 绿 / 蓝 / 半透明白
+        let rgba: [u8; 16] = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128,
+        ];
+        let png = encode_png_rgba(2, 2, &rgba).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        // 解码回像素逐字节比对
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (2, 2));
+        assert_eq!(&buf[..info.buffer_size()], &rgba[..]);
+        // 尺寸 / 数据不匹配时报错而不是 panic
+        assert!(encode_png_rgba(2, 2, &[0; 3]).is_err());
+        assert!(encode_png_rgba(0, 1, &[]).is_err());
     }
 
     /// 真实 MinIO 端到端冒烟测试（默认跳过）：

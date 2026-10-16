@@ -85,7 +85,7 @@ desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS 
 
 - **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
 - **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
-- **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件，bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
+- **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件，bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。支持拖拽文件到页面直接上传与「粘贴图片」（截图 / 复制图片后一键转 PNG 上传；也可 Ctrl+V）。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
 - **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。**启动时做锁屏能力自检**（SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），结果记日志并在设置页展示。
 - **系统集成**：桌面右键菜单弹出历史 / 文件中转站小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow，两条目统一开关管理）；托盘右键菜单含「剪贴板历史 / 文件中转站 / 显示主窗口 / 退出」。
@@ -120,7 +120,7 @@ src/                          # Vue 3 前端
   styles.css                  # 全局设计变量（深浅色自适应）与通用组件样式（卡片/按钮/表单/开关/徽章/空状态）
   components/
     HistoryPage.vue           # 剪贴板历史（compact 属性 = 小窗口紧凑布局）
-    FileHubPage.vue           # 文件中转站（MinIO 上传 / 下载 / 删除 + 传输进度，compact 属性 = 小窗口紧凑布局）
+    FileHubPage.vue           # 文件中转站（MinIO 上传 / 下载 / 删除 + 拖拽 / 粘贴图片上传 + 传输进度，compact 属性 = 小窗口紧凑布局）
     LogPage.vue               # 运行日志（级别筛选 / 刷新 / 清空）
     UpdatePage.vue            # 软件更新检测与安装
     SettingsPage.vue          # 系统设置：MQTT 同步配置 + 文件中转站（MinIO）+ 桌面右键集成 + 开机自启
@@ -131,7 +131,7 @@ src-tauri/
     autostart.rs              # 开机自启：config.json 的 autoStart 意图持久化 + 启动时与系统状态对齐（dev 构建跳过）
     clipboard.rs              # 写剪贴板统一入口（写后读回校验 + 竞争重试），copy_to_clipboard 共用
     config.rs                 # MqttConfig / MinioConfig 持久化（config.json）与校验、MinIO 地址容错解析、bucket 名校验
-    file_hub.rs               # 文件中转站：MinIO 上传 / 下载 / 删除（rust-s3，bucket 可配置，进度事件 filehub://progress）
+    file_hub.rs               # 文件中转站：MinIO 上传 / 下载 / 删除 / 剪贴板图片转 PNG 上传（rust-s3，bucket 可配置，进度事件 filehub://progress）
     secret.rs                 # 本地凭据加密：机器绑定 HKDF-SHA256 + AES-256-GCM（enc:v1: 格式）
     mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）；收包只入队，后台单线程消费
     history.rs                # 剪贴板历史（200 条上限、去重置顶、history.json）
@@ -164,6 +164,7 @@ src-tauri/
 - **MinIO 凭据加密只发生在写盘/读盘**：`secret.rs` 用机器绑定密钥（HKDF-SHA256：ikm=机器码，machine-uid 读不到时退回 hostname；salt=`com.hyy.desktools`，info=`minio-credentials`）+ AES-256-GCM，密文格式 `enc:v1:<base64(nonce‖ciphertext‖tag)>`；`MqttConfig::save()` 加密、`load()` 解密（无前缀按历史明文透传，解密失败按空串 = 换机器后重填）。**不要**给字段加 serde `serialize_with/deserialize_with` 加密属性——那样 `get_mqtt_config` 返回给前端的也会是密文，必须在 save/load 这一层做。tests 用 `minio_credentials_are_encrypted_in_file` / `minio_credentials_stay_plaintext_in_memory_serialization` 双向守住这个边界。
 - **rust-s3 0.38 的几个坑**（file_hub.rs 已处理）：① `list_page` / `delete_object` / `head_object` 都用 `response_data(false)`，HTTP 4xx 不会返回 Err（`fail-on-err` 对它们无效）——列举失败靠 XML 解析错误体现，删除后要自己检查 `status_code()`；② 建桶用 `Bucket::create_with_path_style`，成功与否看返回的 `response_code`（200 成功 / 409 已存在），非 200 不会 Err；③ MinIO 必须 path-style（`with_path_style()`）；region 用 `Region::Custom{region:"us-east-1"}`，MinIO 未配置 region 时 `parseLocationConstraint` 放行任意 LocationConstraint；④ `put_object_stream` 按 8MiB 阈值自动在单次 PUT / 分片上传间切换，读写全程流式不进内存；⑤ multipart 时本地读取进度可能先到 100%，前端进度条封顶 99% 直到 `done` 事件。
 - **文件中转站真实联调**：`src-tauri` 下 `DESKTOOLS_MINIO_HOST=127.0.0.1:9000 DESKTOOLS_MINIO_KEY=xx DESKTOOLS_MINIO_SECRET=yy cargo test file_hub::tests::e2e_minio_roundtrip -- --ignored --nocapture`（可加 `DESKTOOLS_MINIO_BUCKET=xxx` 换桶；会建桶、上传、GET 校验、删除，用小文件）。文件对话框需 `tauri-plugin-dialog`（Rust 插件 + npm 包 + capability `dialog:default`，且窗口 label 必须在该 capability 的 `windows` 列表里）。
-- **Tauri v2 的 ACL 只拦 `plugin:` 命令**：`tauri` 源码（`src/webview/mod.rs`）里只有当请求是插件命令（含 `core:*`，如 `core:event|listen`）或应用自带 ACL manifest 或来自远程 origin 时才校验 capability；自定义命令（`generate_handler!` 注册的）默认不受 ACL 限制。窗口 label 不在任何 capability 的 `windows` 列表时，它的 `listen` / dialog / opener 等插件命令全部被拒（release 报 "Command plugin:xxx not allowed by ACL"，debug 有更详细的 `resolve_access_message`）。历史小窗口曾因为没进 `windows` 列表静默收不到 `history://refresh`（listen 失败被 try/catch 吞了）。新增窗口（如 files）后必须把 label 加进 `capabilities/default.json`（core/opener）和所需插件权限文件（dialog 等）。
+- **Tauri v2 的 ACL 只拦 `plugin:` 命令**：`tauri` 源码（`src/webview/mod.rs`）里只有当请求是插件命令（含 `core:*`，如 `core:event|listen`）或应用自带 ACL manifest 或来自远程 origin 时才校验 capability；自定义命令（`generate_handler!` 注册的）默认不受 ACL 限制。窗口 label 不在任何 capability 的 `windows` 列表时，它的 `listen` / dialog / opener 等插件命令全部被拒（release 报 "Command plugin:xxx not allowed by ACL"，debug 有更详细的 `resolve_access_message`）。历史小窗口曾因为没进 `windows` 列表静默收不到 `history://refresh`（listen 失败被 try/catch 吞了，表象是「右键打开不是最新数据」）；修复后仍保留前端 `window` focus 兜底刷新（HistoryPage / FileHubPage compact）双保险。新增窗口（如 files）后必须把 label 加进 `capabilities/default.json`（core/opener）和所需插件权限文件（dialog 等）。
+- **拖拽上传与剪贴板图片上传**（FileHubPage / file_hub.rs）：窗口 `dragDropEnabled` 默认 `true`（原生接管文件拖放，会禁用 webview 的 HTML5 dnd），前端用 `getCurrentWindow().onDragDropEvent`（底层是 `core:event|listen`，窗口需在 capability `windows` 列表里）拿 `enter/over/drop/leave` + 文件路径。剪贴板图片在 Rust 侧用 `tauri_plugin_clipboard_manager::ClipboardExt::read_image` 读取（插件 ACL 只约束 webview IPC，Rust 侧调用不受限），RGBA 数据在 `spawn_blocking` 里用 `png` crate 编码为 PNG 再走 `put_object_stream_with_content_type` 上传（图片小、不发进度事件）；前端 Ctrl+V 只在剪贴板没有文本时接管，避免拦截正常粘贴。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

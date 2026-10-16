@@ -2,6 +2,7 @@
 import { computed, onActivated, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MqttConfig } from "../store";
@@ -40,14 +41,19 @@ const bucketName = ref("hub");
 const files = ref<HubFile[]>([]);
 const loading = ref(false);
 const uploading = ref(false);
+const uploadingImage = ref(false);
+const dragging = ref(false);
 const error = ref("");
 const downloadedPath = ref("");
+const clipboardSaved = ref("");
 const transfers = ref<Record<string, Transfer>>({});
 const deleteArmed = ref("");
 let disarmTimer: number | undefined;
+let savedTimer: number | undefined;
 let initialized = false;
 let unlisten: UnlistenFn | undefined;
 let unlistenRefresh: UnlistenFn | undefined;
+let unlistenDragDrop: UnlistenFn | undefined;
 
 const transferList = computed(() =>
   Object.entries(transfers.value).map(([id, t]) => ({ id, ...t })),
@@ -99,9 +105,12 @@ async function upload() {
     return;
   }
   if (!picked) return;
-  const paths = Array.isArray(picked) ? picked : [picked];
-  if (!paths.length) return;
+  await uploadPaths(Array.isArray(picked) ? picked : [picked]);
+}
 
+/** 逐个上传本地文件（文件选择器与拖拽共用的入口） */
+async function uploadPaths(paths: string[]) {
+  if (uploading.value || !paths.length) return;
   uploading.value = true;
   error.value = "";
   const failures: string[] = [];
@@ -119,6 +128,66 @@ async function upload() {
     error.value = `上传失败 — ${failures.join("；")}`;
   }
   await refresh();
+}
+
+/** 上传剪贴板图片（截图 / 复制图片后的「粘贴图片」入口，后端统一转 PNG） */
+async function uploadClipboardImage() {
+  if (uploadingImage.value || !configured.value) return;
+  uploadingImage.value = true;
+  error.value = "";
+  try {
+    const key = await invoke<string>("file_hub_upload_image", {
+      name: `clipboard-${stamp()}.png`,
+    });
+    clipboardSaved.value = key;
+    window.clearTimeout(savedTimer);
+    savedTimer = window.setTimeout(() => {
+      clipboardSaved.value = "";
+    }, 4000);
+    await refresh();
+  } catch (e) {
+    error.value = `上传剪贴板图片失败：${String(e)}`;
+  } finally {
+    uploadingImage.value = false;
+  }
+}
+
+/** 本地时间戳（clipboard-YYYYMMDD-HHmmss.png，同名同秒会覆盖） */
+function stamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}` +
+    `-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+  );
+}
+
+/** 原生文件拖拽：enter/over 显示遮罩，drop 后逐个上传 */
+function onDragDrop(payload: DragDropEvent) {
+  if (payload.type === "enter" || payload.type === "over") {
+    dragging.value = true;
+    return;
+  }
+  dragging.value = false;
+  if (payload.type === "drop" && payload.paths.length) {
+    void uploadPaths(payload.paths);
+  }
+}
+
+/** Ctrl+V：剪贴板里是图片（或没有文本）时直接上传剪贴板图片；粘贴文本时不拦截 */
+function onPaste(e: ClipboardEvent) {
+  const text = e.clipboardData?.getData("text/plain") ?? "";
+  const hasImage = Array.from(e.clipboardData?.items ?? []).some((item) =>
+    item.type.startsWith("image/"),
+  );
+  if (!hasImage && text.trim()) return;
+  e.preventDefault();
+  void uploadClipboardImage();
+}
+
+/** 独立小窗口聚焦时兜底刷新（与后端 filehub://refresh 双保险） */
+function onWindowFocus() {
+  void reload();
 }
 
 async function download(file: HubFile) {
@@ -236,9 +305,16 @@ onMounted(async () => {
     unlistenRefresh = await listen("filehub://refresh", () => {
       void reload();
     });
+    // 原生文件拖拽（拖到页面任意位置即可上传；dragDropEnabled 窗口默认开启）
+    unlistenDragDrop = await getCurrentWindow().onDragDropEvent((e) =>
+      onDragDrop(e.payload),
+    );
   } catch {
     /* 浏览器预览等无 Tauri 环境时忽略 */
   }
+  // 独立小窗口聚焦时兜底刷新；Ctrl+V 上传剪贴板图片
+  if (props.compact) window.addEventListener("focus", onWindowFocus);
+  window.addEventListener("paste", onPaste);
   await reload();
   initialized = true;
 });
@@ -250,8 +326,12 @@ onActivated(() => {
 
 onUnmounted(() => {
   window.clearTimeout(disarmTimer);
+  window.clearTimeout(savedTimer);
+  window.removeEventListener("focus", onWindowFocus);
+  window.removeEventListener("paste", onPaste);
   unlisten?.();
   unlistenRefresh?.();
+  unlistenDragDrop?.();
 });
 </script>
 
@@ -259,7 +339,7 @@ onUnmounted(() => {
   <div class="page" :class="{ compact }">
     <header class="page-head">
       <h1>文件中转站</h1>
-      <p>通过 MinIO 在多台设备之间上传、下载、删除文件（bucket：{{ bucketName }}，同名文件会覆盖）</p>
+      <p>通过 MinIO 在多台设备之间上传、下载、删除文件（bucket：{{ bucketName }}；支持拖拽文件、粘贴剪贴板图片上传；同名文件会覆盖）</p>
     </header>
 
     <p v-if="error" class="hint err">{{ error }}</p>
@@ -267,6 +347,7 @@ onUnmounted(() => {
       已保存到 {{ downloadedPath }}
       <button class="link" @click="revealDownloaded">在文件夹中显示</button>
     </p>
+    <p v-if="clipboardSaved" class="hint ok">已上传剪贴板图片 {{ clipboardSaved }}</p>
 
     <section v-if="transferList.length" class="card transfer-card">
       <div v-for="t in transferList" :key="t.id" class="transfer">
@@ -295,6 +376,12 @@ onUnmounted(() => {
         </div>
         <div class="actions">
           <button :disabled="!configured || loading" @click="refresh">刷新</button>
+          <button
+            :disabled="!configured || uploadingImage"
+            @click="uploadClipboardImage"
+          >
+            {{ uploadingImage ? "上传中…" : "粘贴图片" }}
+          </button>
           <button
             class="primary"
             :disabled="!configured || uploading"
@@ -355,9 +442,27 @@ onUnmounted(() => {
           <path d="M12 16v-5.5" />
           <path d="m9.5 12.5 2.5-2.5 2.5 2.5" />
         </svg>
-        <p>{{ loading ? "正在加载…" : "暂无文件，点击右上角「上传文件」开始" }}</p>
+        <p>
+          {{
+            loading
+              ? "正在加载…"
+              : "暂无文件：可「上传文件」、拖拽文件到页面，或「粘贴图片」上传剪贴板截图"
+          }}
+        </p>
       </div>
     </section>
+
+    <!-- 拖拽悬停遮罩（pointer-events: none，不挡原生拖放事件） -->
+    <div v-if="dragging" class="drop-mask">
+      <div class="drop-tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M12 16V4" />
+          <path d="m7 9 5-5 5 5" />
+          <path d="M4 20h16" />
+        </svg>
+        <p>释放以上传文件到「{{ bucketName }}」</p>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -471,6 +576,43 @@ button.link {
 
 button.link:hover {
   background: none;
+}
+
+/* 拖拽上传遮罩 */
+.drop-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--accent-soft);
+  pointer-events: none;
+}
+
+.drop-tip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 26px 44px;
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.drop-tip svg {
+  width: 30px;
+  height: 30px;
+  color: var(--accent);
+}
+
+.drop-tip p {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.88rem;
 }
 
 /* 独立小窗口紧凑布局 */

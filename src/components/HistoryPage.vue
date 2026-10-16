@@ -80,6 +80,11 @@ function formatTime(ts: number): string {
   return `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
 }
 
+/** 窗口聚焦时兜底刷新（与后端 history://refresh 双保险，防止事件丢失导致旧数据） */
+function onWindowFocus() {
+  void load();
+}
+
 onMounted(async () => {
   await load();
   try {
@@ -89,9 +94,11 @@ onMounted(async () => {
   } catch {
     /* ignore */
   }
+  window.addEventListener("focus", onWindowFocus);
 });
 
 onUnmounted(() => {
+  window.removeEventListener("focus", onWindowFocus);
   unlisten?.();
   unlistenRefresh?.();
   clearTimeout(toastTimer);

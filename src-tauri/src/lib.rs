@@ -307,6 +307,34 @@ async fn file_hub_upload(
 }
 
 #[tauri::command]
+async fn file_hub_upload_image(app: tauri::AppHandle, name: String) -> Result<String, String> {
+    let cfg = current_minio(&app);
+    let started = std::time::Instant::now();
+    match file_hub::upload_image(&app, &cfg, &name).await {
+        Ok(key) => {
+            logger::log(
+                &app,
+                logger::INFO,
+                format!(
+                    "文件中转站：上传剪贴板图片完成 {key}（{} ms）",
+                    started.elapsed().as_millis()
+                ),
+            );
+            Ok(key)
+        }
+        Err(err) => {
+            // 「剪贴板中没有图片」属于常见的用户操作提示，用 WARN 避免刷错误日志
+            logger::log(
+                &app,
+                logger::WARN,
+                format!("文件中转站：上传剪贴板图片失败：{err}"),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
 async fn file_hub_download(
     app: tauri::AppHandle,
     key: String,
@@ -399,6 +427,7 @@ pub fn run() {
             minio_test_connection,
             file_hub_list,
             file_hub_upload,
+            file_hub_upload_image,
             file_hub_download,
             file_hub_delete
         ])

@@ -934,6 +934,7 @@ dependencies = [
  "base64 0.22.1",
  "libc",
  "machine-uid",
+ "png 0.17.16",
  "ring",
  "rumqttc",
  "rust-s3",
