@@ -2,21 +2,47 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { platform } from "@tauri-apps/plugin-os";
-import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { mqttStatus, type MqttConfig } from "../store";
 
 /* ---------------- 开机自启 ---------------- */
+interface AutostartState {
+  /** 系统实际是否已注册开机自启 */
+  enabled: boolean;
+  /** 当前构建是否管理开机自启（debug 构建为 false） */
+  managed: boolean;
+}
+
 const autoStart = ref(false);
+const autoStartManaged = ref(true);
+const autoStartBusy = ref(false);
+const autoStartError = ref("");
+
+/** 加载系统实际状态（打开设置页时调用，避免开关状态与实际不符） */
+async function loadAutoStart() {
+  try {
+    const state = await invoke<AutostartState>("get_autostart_state");
+    autoStart.value = state.enabled;
+    autoStartManaged.value = state.managed;
+  } catch {
+    /* 浏览器预览等无 Tauri 环境时保持默认值 */
+  }
+}
 
 async function toggleAutoStart() {
+  if (autoStartBusy.value || !autoStartManaged.value) return;
+  autoStartBusy.value = true;
+  autoStartError.value = "";
   try {
-    if (autoStart.value) {
-      await disable();
-    } else {
-      await enable();
-    }
+    const state = await invoke<AutostartState>("set_autostart", {
+      enabled: !autoStart.value,
+    });
+    autoStart.value = state.enabled;
+    autoStartManaged.value = state.managed;
+  } catch (e) {
+    autoStartError.value = String(e);
+    await loadAutoStart(); // 失败时回读系统实际状态
   } finally {
-    autoStart.value = await isEnabled();
+    autoStartBusy.value = false;
   }
 }
 
@@ -31,6 +57,7 @@ const form = reactive<MqttConfig>({
   deviceId: "",
   autoLock: false,
   autoLockDelaySecs: 5,
+  autoStart: true,
 });
 
 const saving = ref(false);
@@ -146,9 +173,35 @@ async function toggleIntegration() {
   }
 }
 
+/* ---------------- 锁屏能力自检（macOS） ---------------- */
+interface LockReport {
+  platform: string;
+  /** 结论：当前会使用的锁屏方式 */
+  summary: string;
+  /** 修复建议（空串 = 无需处理） */
+  advice: string;
+  /** 是否存在「锁不住 / 只能降级」风险 */
+  degraded: boolean;
+  /** 逐项探测明细 */
+  details: string[];
+}
+
+const lockReport = ref<LockReport | null>(null);
+
+async function loadLockReport() {
+  if (osName !== "macos") return;
+  try {
+    lockReport.value = await invoke<LockReport>("get_lock_capability");
+  } catch {
+    /* ignore */
+  }
+}
+
 onMounted(() => {
   loadConfig();
   loadIntegration();
+  loadAutoStart();
+  loadLockReport();
 });
 </script>
 
@@ -306,6 +359,16 @@ onMounted(() => {
         开启后订阅 {{ csiTopic }}（需先配置 MQTT 连接）：收到「人离开」后开始倒计时，<b>期间收到「靠近」自动取消</b>，
         倒计时结束才真正锁屏。考虑消息投递延迟，建议等待 15~30 秒；两次锁屏间隔至少 60 秒。
       </p>
+
+      <div v-if="lockReport" class="lock-check">
+        <p class="hint" :class="lockReport.degraded ? 'warn' : 'ok'">
+          锁屏能力自检：{{ lockReport.summary }}
+        </p>
+        <p v-if="lockReport.advice" class="hint warn">建议：{{ lockReport.advice }}</p>
+        <ul class="lock-details">
+          <li v-for="detail in lockReport.details" :key="detail">{{ detail }}</li>
+        </ul>
+      </div>
     </section>
 
     <!-- 启动 -->
@@ -316,12 +379,21 @@ onMounted(() => {
           <p class="card-sub">随系统登录自动运行</p>
         </div>
       </div>
-      <label class="switch">
-        <input type="checkbox" :checked="autoStart" @change="toggleAutoStart" />
+      <label class="switch" :class="{ disabled: !autoStartManaged || autoStartBusy }">
+        <input
+          type="checkbox"
+          :checked="autoStart"
+          :disabled="!autoStartManaged || autoStartBusy"
+          @change="toggleAutoStart"
+        />
         <span class="track"><span class="thumb"></span></span>
         <span class="switch-text">开机自动启动</span>
       </label>
-      <p class="hint">
+      <p v-if="autoStartError" class="hint err">{{ autoStartError }}</p>
+      <p v-else-if="!autoStartManaged" class="hint warn">
+        开发构建不管理开机自启（避免自启条目指向 target/debug 二进制），请使用打包版本配置。
+      </p>
+      <p v-else class="hint">
         开机自启时以「仅托盘」模式运行，剪贴板同步在后台继续工作；关闭窗口将最小化到托盘，
         可在托盘菜单中选择「剪贴板历史」「显示主窗口」或「退出」。
       </p>
@@ -367,5 +439,22 @@ onMounted(() => {
 .switch.disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.lock-check {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lock-details {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 </style>

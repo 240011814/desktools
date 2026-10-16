@@ -1,9 +1,9 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State, WindowEvent};
-use tauri_plugin_autostart::ManagerExt;
 
 mod auto_lock;
+mod autostart;
 mod clipboard;
 mod config;
 mod history;
@@ -51,6 +51,8 @@ fn save_mqtt_config(app: tauri::AppHandle, mut cfg: MqttConfig) -> Result<MqttCo
     cfg.host = cfg.host.trim().to_string();
     cfg.group = cfg.group.trim().to_string();
     cfg.username = cfg.username.trim().to_string();
+    // 开机自启由 set_autostart 专管：整份表单保存时保留已持久化意图，避免被前端旧值覆盖
+    cfg.auto_start = app.state::<SyncState>().config.lock().unwrap().auto_start;
     cfg.validate()?;
 
     let path = config::config_path(&app);
@@ -134,6 +136,22 @@ fn set_desktop_integration(
     Ok(shell_integration::status())
 }
 
+#[tauri::command]
+fn get_autostart_state(app: tauri::AppHandle) -> Result<autostart::AutostartState, String> {
+    autostart::state(&app)
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<autostart::AutostartState, String> {
+    autostart::set_enabled(&app, enabled)
+}
+
+/// 锁屏能力自检（macOS：SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），设置页展示
+#[tauri::command]
+fn get_lock_capability() -> auto_lock::LockReport {
+    auto_lock::self_check()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -164,7 +182,10 @@ pub fn run() {
             get_logs,
             clear_logs,
             get_desktop_integration,
-            set_desktop_integration
+            set_desktop_integration,
+            get_autostart_state,
+            set_autostart,
+            get_lock_capability
         ])
         .setup(|app| {
             // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）
@@ -249,8 +270,30 @@ pub fn run() {
             #[cfg(desktop)]
             mqtt::spawn_clipboard_watcher(app.handle().clone());
 
-            // 开机自动启动（登录时以 --hidden 启动，仅驻留托盘）
-            let _ = app.autolaunch().enable();
+            // 开机自启：按 config.json 的 autoStart 意图与系统实际状态对齐（仅打包构建管理，
+            // debug 构建跳过，避免把自启条目指向 target/debug 二进制）
+            autostart::sync_on_startup(app.handle());
+
+            // 锁屏能力自检：启动时探测一次（非破坏性，不锁屏不弹窗），异常时记 WARN 并在设置页展示
+            let lock_report = auto_lock::self_check();
+            if lock_report.degraded {
+                let advice = if lock_report.advice.is_empty() {
+                    String::new()
+                } else {
+                    format!("；建议：{}", lock_report.advice)
+                };
+                logger::log(
+                    app.handle(),
+                    logger::WARN,
+                    format!("锁屏能力自检：{}{advice}", lock_report.summary),
+                );
+            } else {
+                logger::log(
+                    app.handle(),
+                    logger::INFO,
+                    format!("锁屏能力自检：{}", lock_report.summary),
+                );
+            }
 
             // 启动参数决定初始窗口：--history 弹历史窗口，--hidden 仅驻留托盘
             if std::env::args().any(|arg| arg == "--history") {

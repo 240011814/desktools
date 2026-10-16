@@ -86,9 +86,9 @@ desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS 
 - **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
 - **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
-- **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。
+- **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。**启动时做锁屏能力自检**（SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），结果记日志并在设置页展示。
 - **系统集成**：桌面右键菜单弹出历史小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow）；托盘右键菜单含「剪贴板历史 / 显示主窗口 / 退出」。
-- **其他**：开机自启（`--hidden` 仅托盘）、关闭最小化到托盘、minisign 验签自动更新（版本号 `1.0.<git 提交数>`）。
+- **其他**：开机自启（意图持久化到 `config.json` 的 `autoStart`，启动时与系统状态对齐；`--hidden` 仅托盘、debug 构建不管理）、关闭最小化到托盘、minisign 验签自动更新（版本号 `1.0.<git 提交数>`）。
 
 ## 常用命令
 
@@ -125,7 +125,8 @@ src/                          # Vue 3 前端
 src-tauri/
   src/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --hidden）
-    auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）
+    auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）+ 锁屏能力自检
+    autostart.rs              # 开机自启：config.json 的 autoStart 意图持久化 + 启动时与系统状态对齐（dev 构建跳过）
     clipboard.rs              # 写剪贴板统一入口（写后读回校验 + 竞争重试），copy_to_clipboard 共用
     config.rs                 # MqttConfig 持久化（config.json）与校验
     mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）；收包只入队，后台单线程消费
@@ -153,6 +154,8 @@ src-tauri/
 - **`arboard` 读剪贴板返回 Err 是常态**（剪贴板里是图片/文件时），直接 `continue` 忽略；监听线程 700ms 轮询。
 - **macOS 快速操作**：workflow 装在 `~/Library/Services/DeskTools 剪贴板历史.workflow`，首次可能需在「系统设置 → 键盘 → 快捷键 → 服务」启用；`pbs -update` 刷新缓存。Windows 注册表项在 `HKCU\Software\Classes\Directory\Background\shell\DeskToolsHistory`。
 - **配置/历史/日志位置**：`~/Library/Application Support/com.hyy.desktools/`（config.json、history.json），日志在 `~/Library/Logs/com.hyy.desktools/desktools.jsonl`；Windows 在 `%APPDATA%` / `%LOCALAPPDATA%` 对应目录。排查问题可直接删 config.json 重置。
+- **开机自启由 `autostart` 模块统一管理**：`config.json` 的 `autoStart` 是唯一「意图」来源，release 构建启动时只在与系统状态不一致时才写系统（一致时不重写 `~/Library/LaunchAgents/desktools.plist`，否则每次启动都会触发 macOS BTM 重新注册后台项、通知配额被耗尽）；**debug 构建跳过**，防止自启条目被指向 `target/debug` 二进制。设置页开关经 `get_autostart_state` / `set_autostart` 读写（不再直接调 plugin JS API）；`save_mqtt_config` 保存整份表单时会保留已持久化的 `autoStart`，不会被前端旧值覆盖。
+- **锁屏能力自检**：启动时 `auto_lock::self_check()` 非破坏性探测（dlopen/dlsym `SACLockScreenImmediate`、`AXIsProcessTrusted`、`AEDeterminePermissionToAutomateTarget` 以 `askUserIfNeeded=false` 静默查询、`sysadminctl -screenLock status` 读「进入睡眠后需要密码」），结果记日志并经 `get_lock_capability` 在设置页「离人自动锁屏」卡片展示；运行中锁屏降级时逐级记 WARN（能看到 Ctrl+Cmd+Q 失败的具体原因）。
 - **Tauri 类实例不能进深度响应式**：`Update`（`@tauri-apps/plugin-updater`）等继承 `Resource` 的类带 `#` 私有字段，放进 Vue `ref()` 被 Proxy 代理后调用方法会报 `TypeError: Cannot read private member from an object whose class did not declare it`（Windows/macOS 同病）。必须用 `shallowRef` 或 `markRaw` 保存类实例；纯数据对象则无此问题。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

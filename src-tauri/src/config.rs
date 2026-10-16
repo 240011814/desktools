@@ -28,10 +28,17 @@ pub struct MqttConfig {
     /// 收到 leave 后延迟多少秒锁屏（期间检测到有人回来则取消）
     #[serde(default = "default_auto_lock_delay_secs")]
     pub auto_lock_delay_secs: u64,
+    /// 开机自动启动（持久化「意图」；应用启动时与系统实际状态对齐，见 autostart 模块）
+    #[serde(default = "default_auto_start")]
+    pub auto_start: bool,
 }
 
 fn default_auto_lock_delay_secs() -> u64 {
     15
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 impl Default for MqttConfig {
@@ -46,6 +53,7 @@ impl Default for MqttConfig {
             device_id: uuid::Uuid::new_v4().to_string(),
             auto_lock: false,
             auto_lock_delay_secs: default_auto_lock_delay_secs(),
+            auto_start: default_auto_start(),
         }
     }
 }
@@ -158,6 +166,33 @@ mod tests {
         assert_eq!(loaded.host, "broker.emqx.io");
         assert_eq!(loaded.group, "g1");
         assert_eq!(loaded.device_id, cfg.device_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_start_defaults_to_true_for_legacy_config() {
+        // 旧版 config.json 没有 autoStart 字段：按默认开启处理，保持升级前后行为一致
+        let legacy = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1"
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.auto_start);
+    }
+
+    #[test]
+    fn auto_start_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.auto_start = false;
+        cfg.save(&path).unwrap();
+        assert!(!MqttConfig::load(&path).auto_start);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
