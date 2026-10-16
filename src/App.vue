@@ -10,8 +10,10 @@ import UpdatePage from "./components/UpdatePage.vue";
 import SettingsPage from "./components/SettingsPage.vue";
 import { mqttStatus, version, STATUS_TEXT, type MqttStatus } from "./store";
 
-/** 独立历史小窗口模式（桌面右键 / 托盘菜单弹出） */
-const isPopup = new URLSearchParams(location.search).get("popup") === "history";
+/** 独立小窗口模式（桌面右键 / 托盘菜单弹出）：剪贴板历史 / 文件中转站 */
+const popup = new URLSearchParams(location.search).get("popup");
+const isHistoryPopup = popup === "history";
+const isFilesPopup = popup === "files";
 
 /* 侧边栏菜单（icon 为 24x24 stroke 图标） */
 const ICONS: Record<string, string> = {
@@ -81,8 +83,9 @@ onMounted(async () => {
 </script>
 
 <template>
-  <!-- 独立历史小窗口（托盘 / 桌面右键弹出） -->
-  <HistoryPage v-if="isPopup" compact />
+  <!-- 独立小窗口（托盘 / 桌面右键弹出）：剪贴板历史 / 文件中转站 -->
+  <HistoryPage v-if="isHistoryPopup" compact />
+  <FileHubPage v-else-if="isFilesPopup" compact />
 
   <div v-else class="shell">
     <aside class="sidebar">

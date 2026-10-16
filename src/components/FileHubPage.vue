@@ -6,6 +6,9 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { MqttConfig } from "../store";
 
+/** compact：独立文件中转站小窗口布局（桌面右键 / 托盘弹出） */
+const props = defineProps<{ compact?: boolean }>();
+
 /** MinIO 中的文件条目（与后端 file_hub::HubFile 对应） */
 interface HubFile {
   key: string;
@@ -33,6 +36,7 @@ interface Transfer {
 
 const configured = ref(true);
 const configLoaded = ref(false);
+const bucketName = ref("hub");
 const files = ref<HubFile[]>([]);
 const loading = ref(false);
 const uploading = ref(false);
@@ -43,6 +47,7 @@ const deleteArmed = ref("");
 let disarmTimer: number | undefined;
 let initialized = false;
 let unlisten: UnlistenFn | undefined;
+let unlistenRefresh: UnlistenFn | undefined;
 
 const transferList = computed(() =>
   Object.entries(transfers.value).map(([id, t]) => ({ id, ...t })),
@@ -52,6 +57,7 @@ async function loadConfig() {
   try {
     const cfg = await invoke<MqttConfig>("get_mqtt_config");
     configured.value = !!cfg.minio.host.trim();
+    bucketName.value = cfg.minio.bucket?.trim() || "hub";
   } catch (e) {
     error.value = `读取配置失败：${String(e)}`;
   } finally {
@@ -180,7 +186,12 @@ function onProgress(payload: ProgressPayload) {
 }
 
 function goSettings() {
-  location.hash = "settings";
+  if (props.compact) {
+    // 独立小窗口里没有设置页：唤起主窗口去配置
+    void invoke("open_main_window").catch(() => {});
+  } else {
+    location.hash = "settings";
+  }
 }
 
 async function revealDownloaded() {
@@ -217,9 +228,17 @@ function percentOf(t: Transfer): number {
 }
 
 onMounted(async () => {
-  unlisten = await listen<ProgressPayload>("filehub://progress", (e) =>
-    onProgress(e.payload),
-  );
+  try {
+    unlisten = await listen<ProgressPayload>("filehub://progress", (e) =>
+      onProgress(e.payload),
+    );
+    // 打开 / 聚焦文件中转站小窗口时后端触发一次刷新
+    unlistenRefresh = await listen("filehub://refresh", () => {
+      void reload();
+    });
+  } catch {
+    /* 浏览器预览等无 Tauri 环境时忽略 */
+  }
   await reload();
   initialized = true;
 });
@@ -232,14 +251,15 @@ onActivated(() => {
 onUnmounted(() => {
   window.clearTimeout(disarmTimer);
   unlisten?.();
+  unlistenRefresh?.();
 });
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" :class="{ compact }">
     <header class="page-head">
       <h1>文件中转站</h1>
-      <p>通过 MinIO 在多台设备之间上传、下载、删除文件（bucket：hub，同名文件会覆盖）</p>
+      <p>通过 MinIO 在多台设备之间上传、下载、删除文件（bucket：{{ bucketName }}，同名文件会覆盖）</p>
     </header>
 
     <p v-if="error" class="hint err">{{ error }}</p>
@@ -293,7 +313,9 @@ onUnmounted(() => {
           <path d="m9.5 12.5 2.5-2.5 2.5 2.5" />
         </svg>
         <p>尚未配置 MinIO，文件中转站暂不可用</p>
-        <button class="primary" @click="goSettings">去系统设置</button>
+        <button class="primary" @click="goSettings">
+          {{ compact ? "打开主窗口设置" : "去系统设置" }}
+        </button>
       </div>
 
       <!-- 已配置：文件表格 -->
@@ -449,5 +471,31 @@ button.link {
 
 button.link:hover {
   background: none;
+}
+
+/* 独立小窗口紧凑布局 */
+.page.compact {
+  padding: 14px 16px 20px;
+  max-width: none;
+}
+
+.page.compact .page-head {
+  margin-bottom: 12px;
+}
+
+.page.compact .page-head h1 {
+  font-size: 1.05rem;
+}
+
+.page.compact .page-head p {
+  display: none;
+}
+
+.page.compact .card {
+  margin-bottom: 10px;
+}
+
+.page.compact .card:last-child {
+  margin-bottom: 0;
 }
 </style>

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Core permissions for the main window and popup windows (history / files)",
+  "windows": ["main", "history", "files"],
   "permissions": [
     "core:default",
     "opener:default"

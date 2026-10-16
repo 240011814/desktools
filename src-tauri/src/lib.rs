@@ -38,6 +38,24 @@ fn show_history_window(app: &tauri::AppHandle) {
     }
 }
 
+/// 弹出独立的文件中转站小窗口（桌面右键 / 托盘菜单调用）
+fn show_files_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("files") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        logger::log(app, logger::INFO, "已打开文件中转站窗口");
+        // 打开时让前端自动刷新一次（窗口已显示/已聚焦时 show 不触发窗口事件，这里兜底）
+        let _ = app.emit(file_hub::REFRESH_EVENT, ());
+    }
+}
+
+/// 显示主窗口（文件中转站小窗口在未配置 MinIO 时引导用户回主窗口设置）
+#[tauri::command]
+fn open_main_window(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
 #[tauri::command]
 fn get_mqtt_config(state: State<SyncState>) -> MqttConfig {
     state.config.lock().unwrap().clone()
@@ -136,7 +154,7 @@ fn set_desktop_integration(
         &app,
         logger::INFO,
         if enabled {
-            "已启用桌面右键菜单集成（剪贴板历史）"
+            "已启用桌面右键菜单集成（剪贴板历史、文件中转站）"
         } else {
             "已关闭桌面右键菜单集成"
         },
@@ -188,9 +206,10 @@ fn save_minio_config(app: tauri::AppHandle, minio: MinioConfig) -> Result<MinioC
         logger::INFO,
         if saved.configured() {
             format!(
-                "文件中转站：MinIO 配置已保存（{}:{}，TLS {}）",
+                "文件中转站：MinIO 配置已保存（{}:{}，bucket「{}」，TLS {}）",
                 saved.host,
                 saved.port,
+                saved.bucket,
                 if saved.tls { "开" } else { "关" }
             )
         } else {
@@ -341,10 +360,12 @@ async fn file_hub_delete(app: tauri::AppHandle, key: String) -> Result<(), Strin
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // 单实例：桌面右键/快速操作再次启动时，转发给已运行实例打开历史窗口
+        // 单实例：桌面右键/快速操作再次启动时，转发给已运行实例打开对应窗口
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if argv.iter().any(|arg| arg == "--history") {
                 show_history_window(app);
+            } else if argv.iter().any(|arg| arg == "--files") {
+                show_files_window(app);
             }
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -373,6 +394,7 @@ pub fn run() {
             get_autostart_state,
             set_autostart,
             get_lock_capability,
+            open_main_window,
             save_minio_config,
             minio_test_connection,
             file_hub_list,
@@ -384,9 +406,11 @@ pub fn run() {
             // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）
             let history_item =
                 MenuItem::with_id(app, "history", "剪贴板历史", true, None::<&str>)?;
+            let files_item = MenuItem::with_id(app, "files", "文件中转站", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&history_item, &show_item, &quit_item])?;
+            let menu =
+                Menu::with_items(app, &[&history_item, &files_item, &show_item, &quit_item])?;
 
             TrayIconBuilder::with_id("main-tray")
                 .icon(
@@ -399,6 +423,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "history" => show_history_window(app),
+                    "files" => show_files_window(app),
                     "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
@@ -467,6 +492,21 @@ pub fn run() {
             // debug 构建跳过，避免把自启条目指向 target/debug 二进制）
             autostart::sync_on_startup(app.handle());
 
+            // 桌面右键集成：旧版只装过「剪贴板历史」，用户已启用时补齐新增条目（仅打包构建）
+            match shell_integration::sync_on_startup() {
+                Ok(added) if !added.is_empty() => logger::log(
+                    app.handle(),
+                    logger::INFO,
+                    format!("桌面右键菜单集成：已补装条目 {}", added.join("、")),
+                ),
+                Ok(_) => {}
+                Err(err) => logger::log(
+                    app.handle(),
+                    logger::WARN,
+                    format!("桌面右键菜单集成：补装条目失败：{err}"),
+                ),
+            }
+
             // 锁屏能力自检：启动时探测一次（非破坏性，不锁屏不弹窗），异常时记 WARN 并在设置页展示
             let lock_report = auto_lock::self_check();
             if lock_report.degraded {
@@ -488,9 +528,11 @@ pub fn run() {
                 );
             }
 
-            // 启动参数决定初始窗口：--history 弹历史窗口，--hidden 仅驻留托盘
+            // 启动参数决定初始窗口：--history / --files 弹对应小窗口，--hidden 仅驻留托盘
             if std::env::args().any(|arg| arg == "--history") {
                 show_history_window(app.app_handle());
+            } else if std::env::args().any(|arg| arg == "--files") {
+                show_files_window(app.app_handle());
             } else if !std::env::args().any(|arg| arg == "--hidden") {
                 show_main_window(app.app_handle());
             }
@@ -502,10 +544,18 @@ pub fn run() {
                 let _ = window.hide();
                 api.prevent_close();
             }
-            // 历史窗口每次获得焦点时，通知前端自动刷新一次
-            //（show_history_window 在 show 后也会显式触发，覆盖已显示/已聚焦的场景）
-            if window.label() == "history" && matches!(event, WindowEvent::Focused(true)) {
-                let _ = window.emit(history::HISTORY_REFRESH_EVENT, ());
+            // 小窗口每次获得焦点时，通知前端自动刷新一次
+            //（show_xxx_window 在 show 后也会显式触发，覆盖已显示/已聚焦的场景）
+            if matches!(event, WindowEvent::Focused(true)) {
+                match window.label() {
+                    "history" => {
+                        let _ = window.emit(history::HISTORY_REFRESH_EVENT, ());
+                    }
+                    "files" => {
+                        let _ = window.emit(file_hub::REFRESH_EVENT, ());
+                    }
+                    _ => {}
+                }
             }
         })
         .run(tauri::generate_context!())

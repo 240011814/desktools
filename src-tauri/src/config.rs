@@ -6,6 +6,9 @@ use tauri::Manager;
 
 use crate::secret;
 
+/// MinIO 默认存储桶名（bucket 可配置，留空 / 旧配置缺字段时回落该值）
+pub const DEFAULT_BUCKET: &str = "hub";
+
 /// MinIO（文件中转站）配置
 ///
 /// accessKey / secretKey 只在写盘时加密（见 `MqttConfig::save` / `load`，`enc:v1:` 前缀），
@@ -17,6 +20,8 @@ pub struct MinioConfig {
     pub host: String,
     /// 端口
     pub port: u16,
+    /// 存储桶名称（默认 `hub`，不存在时自动创建）
+    pub bucket: String,
     /// 是否使用 TLS（https）
     pub tls: bool,
     /// Access Key
@@ -30,6 +35,7 @@ impl Default for MinioConfig {
         Self {
             host: String::new(),
             port: 9000,
+            bucket: DEFAULT_BUCKET.to_string(),
             tls: false,
             access_key: String::new(),
             secret_key: String::new(),
@@ -43,12 +49,18 @@ impl MinioConfig {
         !self.host.trim().is_empty()
     }
 
-    /// 规范化后的副本：地址容错解析、去除凭据首尾空白
+    /// 规范化后的副本：地址容错解析、去除凭据首尾空白、bucket 留空时回落默认值
     pub fn normalized(&self) -> Self {
         let (host, port, tls) = normalize_endpoint(&self.host, self.port, self.tls);
+        let bucket = self.bucket.trim();
         Self {
             host,
             port,
+            bucket: if bucket.is_empty() {
+                DEFAULT_BUCKET.to_string()
+            } else {
+                bucket.to_string()
+            },
             tls,
             access_key: self.access_key.trim().to_string(),
             secret_key: self.secret_key.trim().to_string(),
@@ -60,11 +72,34 @@ impl MinioConfig {
         if self.port == 0 {
             return Err("端口必须在 1 ~ 65535 之间".into());
         }
+        validate_bucket(&self.bucket)?;
         if self.access_key.is_empty() || self.secret_key.is_empty() {
             return Err("请填写 Access Key 和 Secret Key".into());
         }
         Ok(())
     }
+}
+
+/// 校验 bucket 名（S3 / MinIO 规范）：3 ~ 63 位小写字母、数字、中划线或点，
+/// 首尾必须是字母或数字，且不能出现相邻的 `.` / `.-` / `-.` 组合
+pub fn validate_bucket(bucket: &str) -> Result<(), String> {
+    if !(3..=63).contains(&bucket.len()) {
+        return Err("存储桶名需为 3 ~ 63 个字符".into());
+    }
+    if !bucket
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err("存储桶名只能包含小写字母、数字、中划线和点".into());
+    }
+    let alnum = |c: char| c.is_ascii_alphanumeric();
+    if !bucket.starts_with(alnum) || !bucket.ends_with(alnum) {
+        return Err("存储桶名必须以字母或数字开头和结尾".into());
+    }
+    if bucket.contains("..") || bucket.contains(".-") || bucket.contains("-.") {
+        return Err("存储桶名不能包含相邻的点和中划线组合".into());
+    }
+    Ok(())
 }
 
 /// 容错解析用户填写的 MinIO 服务器地址：
@@ -356,6 +391,8 @@ mod tests {
         let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
         assert!(!cfg.minio.configured());
         assert_eq!(cfg.minio.port, 9000);
+        // 旧配置缺 bucket 字段 → 默认 hub
+        assert_eq!(cfg.minio.bucket, "hub");
 
         // minio 内部字段缺失时应拿到默认端口（MinioConfig 容器级 default）
         let partial = r#"{
@@ -385,6 +422,7 @@ mod tests {
             tls: false,
             access_key: "AK-test-123".into(),
             secret_key: "SK-test-456".into(),
+            ..MinioConfig::default()
         };
         cfg.save(&path).unwrap();
 
@@ -412,6 +450,7 @@ mod tests {
             tls: false,
             access_key: "AK-plain".into(),
             secret_key: "SK-plain".into(),
+            ..MinioConfig::default()
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("AK-plain"));
@@ -431,5 +470,54 @@ mod tests {
         assert!(minio.normalized().validate().is_ok());
         minio.port = 0;
         assert!(minio.validate().is_err());
+        minio.port = 9000;
+        minio.bucket = "Bad_Bucket".into();
+        assert!(minio.validate().is_err());
+    }
+
+    #[test]
+    fn minio_bucket_defaults_and_validation() {
+        // 默认 / 留空 → 回落 hub；首尾空白在规范化时去掉
+        assert_eq!(MinioConfig::default().bucket, DEFAULT_BUCKET);
+        let mut minio = MinioConfig::default();
+        minio.bucket = "   ".into();
+        assert_eq!(minio.normalized().bucket, "hub");
+        minio.bucket = " team-files.v2 ".into();
+        assert_eq!(minio.normalized().bucket, "team-files.v2");
+
+        for ok in ["hub", "abc", "team-files", "a1.b2"] {
+            assert!(validate_bucket(ok).is_ok(), "{ok} 应为合法 bucket 名");
+        }
+        for bad in [
+            "",
+            "ab",
+            "Hub",
+            "bucket name",
+            "bucket_1",
+            "-abc",
+            "abc-",
+            "a..b",
+            "a.-b",
+            "a-.b",
+        ] {
+            assert!(validate_bucket(bad).is_err(), "{bad} 应为非法 bucket 名");
+        }
+    }
+
+    #[test]
+    fn minio_bucket_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.minio = MinioConfig {
+            host: "minio.local".into(),
+            bucket: "team-files".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+            ..MinioConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        assert_eq!(MqttConfig::load(&path).minio.bucket, "team-files");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

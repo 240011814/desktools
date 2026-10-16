@@ -58,7 +58,7 @@ const form = reactive<MqttConfig>({
   autoLock: false,
   autoLockDelaySecs: 5,
   autoStart: true,
-  minio: { host: "", port: 9000, tls: false, accessKey: "", secretKey: "" },
+  minio: { host: "", port: 9000, bucket: "hub", tls: false, accessKey: "", secretKey: "" },
 });
 
 const saving = ref(false);
@@ -191,8 +191,8 @@ const osName = (() => {
 const integrationTitle = osName === "windows" ? "桌面右键菜单" : "Finder 快速操作";
 const integrationDesc =
   osName === "windows"
-    ? "在桌面空白处右键 →「剪贴板历史」，直接弹出历史窗口（Windows 11 需点「显示更多选项」）"
-    : "在 Finder 桌面空白处右键 →「快速操作 / 服务」→「剪贴板历史」，直接弹出历史窗口";
+    ? "在桌面空白处右键 →「剪贴板历史」/「文件中转站」，直接弹出对应窗口（Windows 11 需点「显示更多选项」）"
+    : "在 Finder 桌面空白处右键 →「快速操作 / 服务」→「剪贴板历史」/「文件中转站」，直接弹出对应窗口";
 
 async function loadIntegration() {
   try {
@@ -349,7 +349,7 @@ onMounted(() => {
       <div class="card-head">
         <div>
           <h2>文件中转站（MinIO）</h2>
-          <p class="card-sub">S3 兼容存储；文件放在固定 bucket「hub」中（不存在时自动创建）</p>
+          <p class="card-sub">S3 兼容存储；文件存放在指定 bucket 中（默认 hub，不存在时自动创建）</p>
         </div>
       </div>
 
@@ -368,6 +368,15 @@ onMounted(() => {
           <input v-model.number="form.minio.port" type="number" min="1" max="65535" placeholder="9000" />
         </label>
         <label class="field">
+          <span>存储桶</span>
+          <input
+            v-model.trim="form.minio.bucket"
+            type="text"
+            placeholder="hub（默认）"
+            spellcheck="false"
+          />
+        </label>
+        <label class="field">
           <span>Access Key</span>
           <input
             v-model.trim="form.minio.accessKey"
@@ -377,7 +386,7 @@ onMounted(() => {
             spellcheck="false"
           />
         </label>
-        <label class="field span-2">
+        <label class="field">
           <span>Secret Key</span>
           <input
             v-model="form.minio.secretKey"
@@ -407,6 +416,7 @@ onMounted(() => {
       <p v-if="minioError" class="hint err">{{ minioError }}</p>
       <p v-else-if="minioSaved" class="hint ok">{{ minioSaved }}</p>
       <p v-else class="hint">
+        存储桶留空按 hub 处理（不存在时自动创建，名称需为 3~63 位小写字母、数字、中划线或点）。
         Access Key / Secret Key 以机器绑定加密后存本机（配置文件中不落明文），
         更换电脑或重装系统后需要重新填写；地址留空保存 = 清除配置。
         「测试连接」用当前表单值验证，不影响已保存的配置。

@@ -1,4 +1,4 @@
-//! 文件中转站：通过 MinIO（S3 兼容接口）在固定 bucket `hub` 里上传 / 下载 / 删除文件
+//! 文件中转站：通过 MinIO（S3 兼容接口）在配置的 bucket（默认 `hub`）里上传 / 下载 / 删除文件
 //!
 //! - 连接固定 path-style（MinIO 必需），签名 region 使用 us-east-1（MinIO 默认配置不校验）
 //! - bucket 不存在时自动创建
@@ -19,15 +19,15 @@ use s3::creds::Credentials;
 use s3::region::Region;
 use s3::BucketConfiguration;
 
-use crate::config::{self, MinioConfig};
+use crate::config::MinioConfig;
 use crate::logger::{self, INFO, WARN};
 
-/// 文件中转站固定使用的 bucket（不暴露给用户配置）
-pub const BUCKET: &str = "hub";
 /// SigV4 签名 region（MinIO 未配置 region 时接受任意值，us-east-1 兼容性最好）
 const REGION: &str = "us-east-1";
 /// 传输进度事件名（前端 listen）
 pub const PROGRESS_EVENT: &str = "filehub://progress";
+/// 刷新列表事件名（打开独立小窗口 / 窗口聚焦时后端触发，前端 listen 后自动重载）
+pub const REFRESH_EVENT: &str = "filehub://refresh";
 /// 进度事件最小发送间隔，避免高频 IPC 事件拖慢前端
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -67,15 +67,15 @@ fn require_configured(cfg: &MinioConfig) -> Result<(), String> {
 
 /// 用配置构建 bucket 客户端（path-style；region / 凭据一并返回供建桶复用）
 fn make_bucket(cfg: &MinioConfig) -> Result<(Box<Bucket>, Region, Credentials), String> {
-    let (host, port, tls) = config::normalize_endpoint(&cfg.host, cfg.port, cfg.tls);
-    let scheme = if tls { "https" } else { "http" };
+    let cfg = cfg.normalized();
+    let scheme = if cfg.tls { "https" } else { "http" };
     let region = Region::Custom {
         region: REGION.to_string(),
-        endpoint: format!("{scheme}://{host}:{port}"),
+        endpoint: format!("{scheme}://{}:{}", cfg.host, cfg.port),
     };
     let creds = Credentials::new(Some(&cfg.access_key), Some(&cfg.secret_key), None, None, None)
         .map_err(|e| format!("凭据无效：{e}"))?;
-    let bucket = Bucket::new(BUCKET, region.clone(), creds.clone())
+    let bucket = Bucket::new(&cfg.bucket, region.clone(), creds.clone())
         .map_err(|e| format!("初始化 MinIO 客户端失败：{e}"))?
         .with_path_style();
     Ok((bucket, region, creds))
@@ -84,7 +84,8 @@ fn make_bucket(cfg: &MinioConfig) -> Result<(Box<Bucket>, Region, Credentials), 
 /// 确保 bucket 存在：先做一次廉价的列举探测（max-keys=1），失败则尝试创建
 /// （已存在 / 并发创建视为成功；其余失败原样上报，便于定位权限或网络问题）
 async fn ensure_bucket(cfg: &MinioConfig, app: &AppHandle) -> Result<Box<Bucket>, String> {
-    let (bucket, region, creds) = make_bucket(cfg)?;
+    let cfg = cfg.normalized();
+    let (bucket, region, creds) = make_bucket(&cfg)?;
     if bucket
         .list_page(String::new(), None, None, None, Some(1))
         .await
@@ -92,13 +93,14 @@ async fn ensure_bucket(cfg: &MinioConfig, app: &AppHandle) -> Result<Box<Bucket>
     {
         return Ok(bucket);
     }
-    match Bucket::create_with_path_style(BUCKET, region, creds, BucketConfiguration::default()).await
+    match Bucket::create_with_path_style(&cfg.bucket, region, creds, BucketConfiguration::default())
+        .await
     {
         Ok(resp) if resp.success() => {
             logger::log(
                 app,
                 INFO,
-                format!("文件中转站：bucket「{BUCKET}」不存在，已自动创建"),
+                format!("文件中转站：bucket「{}」不存在，已自动创建", cfg.bucket),
             );
             Ok(bucket)
         }
@@ -329,6 +331,7 @@ pub async fn delete(app: &AppHandle, cfg: &MinioConfig, key: &str) -> Result<(),
 /// 测试连接：确保 bucket 可用并返回一句话结果（设置页展示）
 pub async fn test_connection(app: &AppHandle, cfg: &MinioConfig) -> Result<String, String> {
     require_configured(cfg)?;
+    let bucket_name = cfg.normalized().bucket;
     let bucket = ensure_bucket(cfg, app).await?;
     let pages = bucket
         .list(String::new(), None)
@@ -336,7 +339,7 @@ pub async fn test_connection(app: &AppHandle, cfg: &MinioConfig) -> Result<Strin
         .map_err(|e| format!("列举文件失败：{e}"))?;
     let count: usize = pages.iter().map(|page| page.contents.len()).sum();
     Ok(format!(
-        "连接成功：bucket「{BUCKET}」可用，当前共有 {count} 个文件"
+        "连接成功：bucket「{bucket_name}」可用，当前共有 {count} 个文件"
     ))
 }
 
@@ -571,6 +574,8 @@ mod tests {
             access_key: std::env::var("DESKTOOLS_MINIO_KEY").expect("缺少 DESKTOOLS_MINIO_KEY"),
             secret_key: std::env::var("DESKTOOLS_MINIO_SECRET")
                 .expect("缺少 DESKTOOLS_MINIO_SECRET"),
+            // 可用 DESKTOOLS_MINIO_BUCKET 覆盖（默认 hub）
+            bucket: std::env::var("DESKTOOLS_MINIO_BUCKET").unwrap_or_else(|_| "hub".into()),
         };
         let (bucket, _, _) = make_bucket(&cfg).unwrap();
         let key = format!(

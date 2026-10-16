@@ -7,6 +7,8 @@ export interface MinioConfig {
   /** 服务器地址（主机名 / IP，也兼容粘贴 http://ip:9000 形式） */
   host: string;
   port: number;
+  /** 存储桶名称（默认 hub，不存在时自动创建） */
+  bucket: string;
   tls: boolean;
   accessKey: string;
   secretKey: string;
