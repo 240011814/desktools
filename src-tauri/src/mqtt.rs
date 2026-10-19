@@ -245,8 +245,9 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                                 format!("自动锁屏已开启，已订阅 {}", auto_lock::CSI_NOTIFY_TOPIC),
                             );
                         }
-                        // 锁屏同步开启时，额外订阅 locksync/<group>
-                        if cfg.lock_sync {
+                        // 锁屏同步开了收或发任一端时，额外订阅 locksync/<group>
+                        // （只广播的机器也会订阅并收到事件，由 handle_event 的「跟随」门禁拦截）
+                        if cfg.lock_sync_publish || cfg.lock_sync_follow {
                             let lock_topic = lock_sync::topic(&cfg.group);
                             let _ = client.subscribe(lock_topic.clone(), QoS::AtLeastOnce).await;
                             logger::log(&app, INFO, format!("锁屏同步已开启，已订阅 {lock_topic}"));

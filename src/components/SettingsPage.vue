@@ -56,8 +56,11 @@ const form = reactive<MqttConfig>({
   group: "",
   deviceId: "",
   autoLock: false,
-  autoLockDelaySecs: 5,
-  lockSync: false,
+  autoLockDelaySecs: 15,
+  // 锁屏同步（收发分离 + 活跃守卫）
+  lockSyncPublish: false,
+  lockSyncFollow: false,
+  lockSyncIdleGuardSecs: 300,
   autoStart: true,
   minio: { host: "", port: 9000, bucket: "hub", tls: false, accessKey: "", secretKey: "" },
 });
@@ -174,33 +177,49 @@ async function toggleAutoLock() {
   await saveAutoLockFlag(!form.autoLock);
 }
 
-/* ---------------- 锁屏同步 ---------------- */
+/* ---------------- 锁屏同步（收发两个开关 + 活跃守卫阈值，走窄接口保存） ---------------- */
 const lockSyncTopic = computed(() => `locksync/${form.group.trim() || "<group号>"}`);
 const lockSyncBusy = ref(false);
 const lockSyncError = ref("");
 const lockSyncSaved = ref(false);
 
-async function saveLockSyncFlag(enabled = form.lockSync) {
+/** 钳制活跃守卫阈值：0~3600；清空 / 非法输入回落 300（守卫误关的代价是误锁，宁保守） */
+function clampIdleGuardSecs() {
+  const n = Math.round(Number(form.lockSyncIdleGuardSecs));
+  form.lockSyncIdleGuardSecs = Number.isFinite(n) ? Math.min(3600, Math.max(0, n)) : 300;
+}
+
+async function saveLockSyncFlag(publish = form.lockSyncPublish, follow = form.lockSyncFollow) {
   if (lockSyncBusy.value) return;
   lockSyncBusy.value = true;
   lockSyncError.value = "";
   lockSyncSaved.value = false;
   try {
-    const saved = await invoke<MqttConfig>("set_lock_sync", { enabled });
+    clampIdleGuardSecs();
+    const saved = await invoke<MqttConfig>("set_lock_sync", {
+      publish,
+      follow,
+      idleGuardSecs: form.lockSyncIdleGuardSecs,
+    });
     Object.assign(form, saved);
     lockSyncSaved.value = true;
     setTimeout(() => (lockSyncSaved.value = false), 4000);
   } catch (e) {
     lockSyncError.value = String(e);
-    await loadConfig();
+    await loadConfig(); // 保存失败回读持久化配置,开关显示与实际状态对齐
   } finally {
     lockSyncBusy.value = false;
   }
 }
 
-async function toggleLockSync() {
+async function togglePublish() {
   if (lockSyncBusy.value) return;
-  await saveLockSyncFlag(!form.lockSync);
+  await saveLockSyncFlag(!form.lockSyncPublish, form.lockSyncFollow);
+}
+
+async function toggleFollow() {
+  if (lockSyncBusy.value) return;
+  await saveLockSyncFlag(form.lockSyncPublish, !form.lockSyncFollow);
 }
 
 /* ---------------- 桌面右键菜单集成 ---------------- */
@@ -533,25 +552,49 @@ onMounted(() => {
       <div class="card-head">
         <div>
           <h2>锁屏同步</h2>
-          <p class="card-sub">订阅 {{ lockSyncTopic }}：一台设备锁屏 / 解锁时通知同组其他设备</p>
+          <p class="card-sub">topic {{ lockSyncTopic }}：收 / 发两个开关独立控制</p>
         </div>
       </div>
       <label class="switch" :class="{ disabled: lockSyncBusy }">
         <input
           type="checkbox"
-          :checked="form.lockSync"
+          :checked="form.lockSyncPublish"
           :disabled="lockSyncBusy"
-          @change="toggleLockSync"
+          @change="togglePublish"
         />
         <span class="track"><span class="thumb"></span></span>
-        <span class="switch-text">开启锁屏同步</span>
+        <span class="switch-text">广播我的锁屏</span>
+      </label>
+      <p class="hint">本机锁定 / 解锁时通知同组设备（不勾选则本机状态对外静默）。</p>
+      <label class="switch" :class="{ disabled: lockSyncBusy }">
+        <input
+          type="checkbox"
+          :checked="form.lockSyncFollow"
+          :disabled="lockSyncBusy"
+          @change="toggleFollow"
+        />
+        <span class="track"><span class="thumb"></span></span>
+        <span class="switch-text">跟随其他设备锁屏</span>
+      </label>
+      <label class="field">
+        <span>活跃守卫阈值（秒）</span>
+        <input
+          v-model.number="form.lockSyncIdleGuardSecs"
+          type="number"
+          min="0"
+          max="3600"
+          placeholder="300"
+          :disabled="lockSyncBusy || !form.lockSyncFollow"
+          @change="saveLockSyncFlag()"
+        />
       </label>
       <p v-if="lockSyncError" class="hint err">{{ lockSyncError }}</p>
       <p v-else-if="lockSyncSaved" class="hint ok">锁屏同步设置已保存</p>
       <p v-else class="hint">
-        <b>本机锁屏 → 同组设备一起锁屏；本机解锁 → 其他设备屏幕亮起</b>
-        （停在锁屏界面，需输入密码才能进入，不会绕过密码）。需先配置并保存上方 MQTT 连接，
-        且两台设备都开启此开关；关闭后不再收发锁屏事件。
+        收到远端锁屏事件时：<b>本机最近 N 秒内有人键鼠操作则跳过锁定</b>——
+        正在使用的设备（如工作机）不会被其他设备的锁屏联动误锁；人离开超过阈值才执行。
+        填 0 关闭守卫总是跟随。远端解锁事件仅唤醒屏幕（停在锁屏界面，不会绕过密码）。
+        需先配置并保存上方 MQTT 连接。
       </p>
     </section>
 

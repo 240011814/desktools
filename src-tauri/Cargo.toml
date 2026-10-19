@@ -15,11 +15,11 @@ name = "desktools_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.3", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-opener = "2"
+tauri = { version = "2.12.4", features = ["tray-icon"] }
+tauri-plugin-opener = "2.7.2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,14 +30,14 @@ rumqttc = "0.25"
 rust-s3 = { version = "0.38", default-features = false, features = ["tokio-rustls-tls-ring", "fail-on-err"] }
 tokio = { version = "1", features = ["rt", "time", "fs", "io-util"] }
 # 剪贴板图片上传：读取系统剪贴板图片（RGBA）后编码为 PNG
-png = "0.17"
+png = "0.18.1"
 uuid = { version = "1", features = ["v4"] }
 # 配置文件中 MinIO 凭据的机器绑定加密（HKDF-SHA256 + AES-256-GCM）
 ring = "0.17"
-base64 = "0.22"
+base64 = "0.23.1"
 machine-uid = "0.6"
 # macOS 系统锁屏接口（SACLockScreenImmediate）dlopen 用
-libc = "0.2"
+libc = "0.2.191"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -51,11 +51,14 @@ panic = "abort"
 strip = true
 
 [target.'cfg(windows)'.dependencies]
-# 锁屏同步：Windows 锁屏状态检测（OpenInputDesktop）与显示器唤醒（SC_MONITORPOWER / SetThreadExecutionState）
+# 锁屏同步：Windows 锁屏状态检测（OpenInputDesktop）、显示器唤醒（SC_MONITORPOWER /
+# SetThreadExecutionState）与活跃守卫（GetLastInputInfo / GetTickCount）
 windows-sys = { version = "0.60", features = [
   "Win32_Foundation",
   "Win32_System_Power",
   "Win32_System_StationsAndDesktops",
+  "Win32_System_SystemInformation",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

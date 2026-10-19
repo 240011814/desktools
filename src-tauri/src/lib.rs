@@ -173,13 +173,23 @@ fn set_auto_lock(
     )
 }
 
-/// 切换「锁屏同步」开关（窄接口，同上）
+/// 更新「锁屏同步」（窄接口，同上）：广播 / 跟随两个开关 + 活跃守卫阈值。
+/// 任一端开启时要求 MQTT 已配置；阈值 0 = 关闭守卫（总是跟随）
 #[tauri::command]
-fn set_lock_sync(app: tauri::AppHandle, enabled: bool) -> Result<MqttConfig, String> {
+fn set_lock_sync(
+    app: tauri::AppHandle,
+    publish: bool,
+    follow: bool,
+    idle_guard_secs: u64,
+) -> Result<MqttConfig, String> {
     apply_switch_update(
         &app,
-        |cfg| cfg.lock_sync = enabled,
-        if enabled {
+        |cfg| {
+            cfg.lock_sync_publish = publish;
+            cfg.lock_sync_follow = follow;
+            cfg.lock_sync_idle_guard_secs = idle_guard_secs.clamp(0, 3600);
+        },
+        if publish || follow {
             validate_switch_on
         } else {
             validate_switch_off

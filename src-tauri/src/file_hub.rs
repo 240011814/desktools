@@ -687,7 +687,10 @@ mod tests {
         // 解码回像素逐字节比对
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let buf_size = reader
+            .output_buffer_size()
+            .expect("png reader 就绪后 buffer 尺寸应为 Some");
+        let mut buf = vec![0u8; buf_size];
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!((info.width, info.height), (2, 2));
         assert_eq!(&buf[..info.buffer_size()], &rgba[..]);

@@ -166,10 +166,17 @@ pub struct MqttConfig {
     /// 收到 leave 后延迟多少秒锁屏（期间检测到有人回来则取消）
     #[serde(default = "default_auto_lock_delay_secs")]
     pub auto_lock_delay_secs: u64,
-    /// 锁屏同步：本机锁屏 / 解锁事件通过 MQTT（locksync/<group>）通知同组设备，
-    /// 其他设备跟随锁屏 / 唤醒屏幕（默认关闭）
+    /// 锁屏同步（收发分离）：把本机锁屏 / 解锁事件通过 MQTT（locksync/<group>）通知同组设备。
+    /// 与「跟随」拆成两个独立开关——工作机等「正在被使用的设备」可以只广播不跟随。
     #[serde(default)]
-    pub lock_sync: bool,
+    pub lock_sync_publish: bool,
+    /// 锁屏同步（收发分离）：跟随同组其他设备的锁屏事件（本机未锁且活跃守卫未触发时才锁定）
+    #[serde(default)]
+    pub lock_sync_follow: bool,
+    /// 活跃守卫阈值（秒）：收到远端锁屏事件时，本机最近这么长时间内有键鼠输入则跳过
+    /// （人正在用的设备不被联动锁屏）。0 = 关闭守卫，总是跟随。
+    #[serde(default = "default_lock_sync_idle_guard_secs")]
+    pub lock_sync_idle_guard_secs: u64,
     /// 开机自动启动（持久化「意图」；应用启动时与系统实际状态对齐，见 autostart 模块）
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
@@ -180,6 +187,11 @@ pub struct MqttConfig {
 
 fn default_auto_lock_delay_secs() -> u64 {
     15
+}
+
+/// 活跃守卫阈值默认 300 秒：5 分钟内用过这台机器的人，不该被远端锁屏事件锁掉
+fn default_lock_sync_idle_guard_secs() -> u64 {
+    300
 }
 
 fn default_auto_start() -> bool {
@@ -198,7 +210,9 @@ impl Default for MqttConfig {
             device_id: uuid::Uuid::new_v4().to_string(),
             auto_lock: false,
             auto_lock_delay_secs: default_auto_lock_delay_secs(),
-            lock_sync: false,
+            lock_sync_publish: false,
+            lock_sync_follow: false,
+            lock_sync_idle_guard_secs: default_lock_sync_idle_guard_secs(),
             auto_start: default_auto_start(),
             minio: MinioConfig::default(),
         }
@@ -213,7 +227,19 @@ impl MqttConfig {
 
     pub fn load(path: &Path) -> Self {
         let mut config = match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str::<MqttConfig>(&text).unwrap_or_default(),
+            Ok(text) => {
+                // 版本迁移：旧配置只有单一 lockSync 开关，按值映射到收 / 发两个开关
+                // （活跃守卫阈值取默认 300）。新格式保存后不再写 lockSync，映射不再触发。
+                let legacy_lock_sync = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("lockSync").and_then(|b| b.as_bool()));
+                let mut cfg = serde_json::from_str::<MqttConfig>(&text).unwrap_or_default();
+                if let Some(enabled) = legacy_lock_sync {
+                    cfg.lock_sync_publish = enabled;
+                    cfg.lock_sync_follow = enabled;
+                }
+                cfg
+            }
             Err(_) => MqttConfig::default(),
         };
         // 兼容旧配置 / 手工删除 deviceId 的情况
@@ -361,7 +387,7 @@ mod tests {
 
     #[test]
     fn lock_sync_defaults_off_for_legacy_config() {
-        // 旧版 config.json 没有 lockSync 字段：默认关闭，升级后不改变现有行为
+        // 没有 lockSync / 新字段的历史配置（更早版本）：默认全部关闭，升级后不改变行为
         let legacy = r#"{
             "host": "broker.emqx.io",
             "port": 1883,
@@ -372,7 +398,38 @@ mod tests {
             "deviceId": "dev-1"
         }"#;
         let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
-        assert!(!cfg.lock_sync);
+        assert!(!cfg.lock_sync_publish);
+        assert!(!cfg.lock_sync_follow);
+        assert_eq!(cfg.lock_sync_idle_guard_secs, 300);
+    }
+
+    #[test]
+    fn legacy_lock_sync_flag_migrates_to_two_switches() {
+        // 旧版单开关 lockSync=true：迁移为广播 + 跟随都开（守卫阈值取默认，防误伤直接生效）
+        // 迁移发生在 MqttConfig::load 里，所以这里走文件读写而非直接反序列化
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            &path,
+            r#"{"host":"a","port":1883,"username":"","password":"","tls":false,"group":"g","deviceId":"d","lockSync":true}"#,
+        )
+        .unwrap();
+        let cfg_on = MqttConfig::load(&path);
+        assert!(cfg_on.lock_sync_publish);
+        assert!(cfg_on.lock_sync_follow);
+        assert_eq!(cfg_on.lock_sync_idle_guard_secs, 300);
+
+        std::fs::write(
+            &path,
+            r#"{"host":"a","port":1883,"username":"","password":"","tls":false,"group":"g","deviceId":"d","lockSync":false}"#,
+        )
+        .unwrap();
+        let cfg_off = MqttConfig::load(&path);
+        assert!(!cfg_off.lock_sync_publish);
+        assert!(!cfg_off.lock_sync_follow);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -382,9 +439,18 @@ mod tests {
         let mut cfg = MqttConfig::default();
         cfg.host = "broker.emqx.io".into();
         cfg.group = "g1".into();
-        cfg.lock_sync = true;
+        cfg.lock_sync_publish = true;
+        cfg.lock_sync_follow = false;
+        cfg.lock_sync_idle_guard_secs = 120;
         cfg.save(&path).unwrap();
-        assert!(MqttConfig::load(&path).lock_sync);
+        let loaded = MqttConfig::load(&path);
+        assert!(loaded.lock_sync_publish);
+        assert!(!loaded.lock_sync_follow);
+        assert_eq!(loaded.lock_sync_idle_guard_secs, 120);
+
+        // 新格式文件不再写旧版 lockSync 字段（避免再次触发迁移覆盖新开关联动）
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"lockSync\":"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

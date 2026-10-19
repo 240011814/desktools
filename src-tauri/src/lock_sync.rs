@@ -1,12 +1,16 @@
-//! 锁屏同步：本机锁屏 / 解锁事件经 MQTT（`locksync/<group号>`）通知同组其他设备。
+//! 锁屏同步：本机锁屏 / 解锁事件经 MQTT（`locksync/<group号>`）与同组设备联动。
 //!
+//! - 收发分离：`lockSyncPublish`（广播我的锁屏 / 解锁状态）与 `lockSyncFollow`（跟随他人）
+//!   是两个独立开关——工作机等「正在被使用的设备」可以只广播、不跟随，或者都不启用。
 //! - 本机状态：轮询检测（约 1 秒；macOS `CGSessionCopyCurrentDictionary`，Windows `OpenInputDesktop`），
 //!   仅在「未锁 → 已锁」/「已锁 → 未锁」跃迁时发布；启动 / 开关刚开启时以当前状态为基准，不补发旧事件。
-//! - 远端事件：`lock` → 复用 `auto_lock` 的锁屏链路锁定本机；`unlock` → 仅唤醒显示器到锁屏界面
-//!   （远程无法、也不应绕过密码真正解锁）。
+//! - 远端事件：`lock` → 复用 `auto_lock` 的锁屏链路锁定本机，但受**活跃守卫**约束
+//!   （本机最近 `lockSyncIdleGuardSecs` 秒内有人键鼠输入则跳过；0 = 关闭守卫；探测失败
+//!   fail-open：照常锁屏并记 WARN）；`unlock` → 仅唤醒显示器到锁屏界面（远程无法、
+//!   也不应绕过密码真正解锁）。
 //! - 防回环：消息带 `deviceId`（自身消息忽略）；应用远端锁屏后进入发布抑制窗口
-//!   （`REMOTE_SUPPRESS_MS`），本机随之发生的同状态变化不再发布，避免
-//!   A 锁 → B 锁 → B 又发布 → A 再锁 的回环。
+//!   （`REMOTE_SUPPRESS_MS`），本机随之发生的同状态变化不再发布，
+//!   避免 A 锁 → B 锁 → B 又发布 → A 再锁 的回环。
 
 use std::sync::Mutex;
 
@@ -127,8 +131,8 @@ impl LockSyncState {
             .lock()
             .unwrap()
             .clone();
-        if !cfg.lock_sync {
-            return; // 开关关闭：不处理（防御；关闭后本就未订阅该 topic）
+        if !cfg.lock_sync_follow {
+            return; // 「跟随」开关关闭：不处理（防御；关闭时本就未订阅该 topic）
         }
         let event = match parse_remote_message(raw, &cfg.device_id) {
             Ok(Some(event)) => event,
@@ -147,12 +151,37 @@ impl LockSyncState {
         };
         match event {
             LockEvent::Lock => {
-                // 先标记抑制再执行锁屏：监听线程随后观察到的「已锁」跃迁不再对外发布
-                self.mark_remote_locked();
                 if is_screen_locked().unwrap_or(false) {
                     logger::log(app, INFO, "锁屏同步：收到远端锁屏事件，本机已处于锁屏状态");
                     return;
                 }
+                // 活跃守卫：有人正在本机操作时不用被远端事件锁掉，跳过（记 INFO 便于排查）。
+                // 阈值 0 = 关闭守卫；探测失败 fail-open：照常锁屏、失败详情记 WARN。
+                let threshold = cfg.lock_sync_idle_guard_secs;
+                let idle = input_idle_secs();
+                if guard_blocks(&idle, threshold) {
+                    // 这里 idle 必为 Ok（guard_blocks 只在 Ok 分支返回 true）
+                    let idle_secs = idle.as_ref().unwrap_or(&0);
+                    logger::log(
+                        app,
+                        INFO,
+                        format!(
+                            "锁屏同步：收到远端锁屏事件，已跳过——本机 {} 秒内有人操作（活跃守卫阈值 {} 秒）",
+                            idle_secs, threshold
+                        ),
+                    );
+                    return;
+                }
+                if let Err(err) = &idle {
+                    logger::log(
+                        app,
+                        WARN,
+                        format!("锁屏同步：活跃守卫探测失败（{err}），本次照常锁屏"),
+                    );
+                }
+                // 先标记抑制再执行锁屏：监听线程随后观察到的「已锁」跃迁不再对外发布
+                // （已在锁定 / 守卫跳过的分支不会发生本机状态变化，无须标记）
+                self.mark_remote_locked();
                 logger::log(app, INFO, "锁屏同步：收到远端锁屏事件，正在锁定本机");
                 match auto_lock::lock_screen(app) {
                     Ok(method) => {
@@ -173,6 +202,99 @@ impl LockSyncState {
             }
         }
     }
+}
+
+/// 活跃守卫判定（纯逻辑，供测试）：
+/// - `idle`: `Ok(空闲秒数)` 为探测成功；探测失败 / 阈值为 0 都不拦截（fail-open：
+///   锁屏联动优先，探测失败只记日志）——守卫的语义是「防误伤」而不是「门禁」
+/// - 返回 true = 应跳过本次远端锁屏；false = 照常锁定
+pub fn guard_blocks(idle: &Result<u64, String>, threshold_secs: u64) -> bool {
+    if threshold_secs == 0 {
+        return false; // 守卫关闭：总是跟随
+    }
+    match idle {
+        Ok(idle_secs) => *idle_secs < threshold_secs,
+        Err(_) => false, // 探测失败：偏向继续锁
+    }
+}
+
+/// 本机最近一次键鼠输入距今的空闲秒数（活跃守卫的输入源；探测失败返回 Err）。
+/// 探测不出任何权限要求，属于只读的输入状态查询。
+pub fn input_idle_secs() -> Result<u64, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_idle_secs()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_idle_secs()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台不支持输入空闲检测".into())
+    }
+}
+
+/// macOS：`CGEventSourceSecondsSinceLastEventType(CombinedSession, AnyInput)`。
+/// 只读取输入事件流的聚合空闲时长、不安装事件钩子，预期不需要辅助功能 /
+/// Input Monitoring 权限（真机验证；异常时返回 Err，调用方按 fail-open 处理）
+#[cfg(target_os = "macos")]
+fn macos_idle_secs() -> Result<u64, String> {
+    use std::ffi::c_void;
+
+    /// CGEventSourceStateID::kCGEventSourceStateCombinedSessionState
+    const COMBINED_SESSION: i32 = 0;
+    /// kCGAnyInputEventType = ~0（任意输入事件类型）
+    const ANY_INPUT: u32 = u32::MAX;
+
+    type SinceLast = unsafe extern "C" fn(i32, u32) -> f64;
+
+    /// dlopen 的框架句柄，Drop 时 dlclose（与 is_screen_locked 相同的模式，不泄漏引用计数）
+    struct Framework(*mut c_void);
+    impl Drop for Framework {
+        fn drop(&mut self) {
+            unsafe { libc::dlclose(self.0) };
+        }
+    }
+
+    let cg = Framework(
+        auto_lock::open_framework("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            .ok_or("dlopen CoreGraphics 失败")?,
+    );
+
+    let since_last: SinceLast = unsafe {
+        std::mem::transmute(
+            auto_lock::dlsym_checked(cg.0, "CGEventSourceSecondsSinceLastEventType")
+                .ok_or("缺少 CGEventSourceSecondsSinceLastEventType")?,
+        )
+    };
+
+    let secs = unsafe { since_last(COMBINED_SESSION, ANY_INPUT) };
+    if !secs.is_finite() {
+        return Err(format!(
+            "CGEventSourceSecondsSinceLastEventType 返回 {secs}"
+        ));
+    }
+    Ok(if secs < 0.0 { 0 } else { secs as u64 })
+}
+
+/// Windows：`GetLastInputInfo`（无需任何权限）取最后一次输入的 tick，
+/// 与当前 tick 做 49.7 天回绕安全的差值
+#[cfg(target_os = "windows")]
+fn windows_idle_secs() -> Result<u64, String> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    let ok = unsafe { GetLastInputInfo(&mut info) };
+    if ok == 0 {
+        return Err("GetLastInputInfo 失败".into());
+    }
+    let idle_ms = unsafe { GetTickCount() }.wrapping_sub(info.dwTime);
+    Ok(u64::from(idle_ms / 1000))
 }
 
 /// 本机屏幕是否处于锁定状态：
@@ -385,12 +507,12 @@ pub fn spawn_watcher(app: AppHandle) {
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
 
                 let sync = app.state::<crate::mqtt::SyncState>();
-                let (enabled, group, client) = {
+                let (publish, group, client) = {
                     let cfg = sync.config.lock().unwrap();
-                    (cfg.lock_sync, cfg.group.clone(), sync.client())
+                    (cfg.lock_sync_publish, cfg.group.clone(), sync.client())
                 };
-                if !enabled || group.trim().is_empty() {
-                    // 关闭 / 未配置：清除基准，下次开启时重新建立，不补发历史状态
+                if !publish || group.trim().is_empty() {
+                    // 「广播」关闭 / 未配置：清除基准，下次开启时重新建立，不补发历史状态
                     baseline = None;
                     continue;
                 }
@@ -523,6 +645,34 @@ mod tests {
             .replace((2_000 + REMOTE_SUPPRESS_MS, true));
         assert!(!state.should_suppress_at(false, 2_000));
         assert!(!state.should_suppress_at(true, 2_000));
+    }
+
+    #[test]
+    fn guard_blocks_recent_activity_only() {
+        let probe: Result<u64, String> = Ok(10);
+        // 10 秒前刚用过：拦截
+        assert!(guard_blocks(&probe, 300));
+        // 阈值边界：300 秒空闲恰好在阈值上，不算「有人操作」
+        let at_threshold: Result<u64, String> = Ok(300);
+        assert!(!guard_blocks(&at_threshold, 300));
+        let idle_long: Result<u64, String> = Ok(60_000);
+        assert!(!guard_blocks(&idle_long, 300));
+    }
+
+    #[test]
+    fn guard_disabled_at_zero_threshold_and_fails_open() {
+        let probe: Result<u64, String> = Ok(0); // 刚刚还在输入
+        // 阈值 0 = 守卫关闭：总是跟随
+        assert!(!guard_blocks(&probe, 0));
+        // 探测失败 fail-open：不拦截
+        let broken: Result<u64, String> = Err("权限被拒绝".into());
+        assert!(!guard_blocks(&broken, 300));
+    }
+
+    /// 真实探测一次本机输入空闲时长：保证 dlopen/dlsym/FFI 链路不 panic（不校验具体值）
+    #[test]
+    fn real_idle_probe_does_not_panic() {
+        let _ = input_idle_secs();
     }
 
     /// 真实探测一次本机锁屏状态：保证 dlopen/dlsym 链路不 panic（不校验具体值）
