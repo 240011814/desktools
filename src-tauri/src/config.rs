@@ -166,6 +166,10 @@ pub struct MqttConfig {
     /// 收到 leave 后延迟多少秒锁屏（期间检测到有人回来则取消）
     #[serde(default = "default_auto_lock_delay_secs")]
     pub auto_lock_delay_secs: u64,
+    /// 锁屏同步：本机锁屏 / 解锁事件通过 MQTT（locksync/<group>）通知同组设备，
+    /// 其他设备跟随锁屏 / 唤醒屏幕（默认关闭）
+    #[serde(default)]
+    pub lock_sync: bool,
     /// 开机自动启动（持久化「意图」；应用启动时与系统实际状态对齐，见 autostart 模块）
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
@@ -194,6 +198,7 @@ impl Default for MqttConfig {
             device_id: uuid::Uuid::new_v4().to_string(),
             auto_lock: false,
             auto_lock_delay_secs: default_auto_lock_delay_secs(),
+            lock_sync: false,
             auto_start: default_auto_start(),
             minio: MinioConfig::default(),
         }
@@ -342,6 +347,35 @@ mod tests {
         cfg.auto_start = false;
         cfg.save(&path).unwrap();
         assert!(!MqttConfig::load(&path).auto_start);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lock_sync_defaults_off_for_legacy_config() {
+        // 旧版 config.json 没有 lockSync 字段：默认关闭，升级后不改变现有行为
+        let legacy = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1"
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!cfg.lock_sync);
+    }
+
+    #[test]
+    fn lock_sync_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.host = "broker.emqx.io".into();
+        cfg.group = "g1".into();
+        cfg.lock_sync = true;
+        cfg.save(&path).unwrap();
+        assert!(MqttConfig::load(&path).lock_sync);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

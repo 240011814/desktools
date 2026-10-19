@@ -26,6 +26,8 @@ export interface MqttConfig {
   autoLock: boolean;
   /** 收到 leave 后延迟多少秒锁屏（1~300） */
   autoLockDelaySecs: number;
+  /** 锁屏同步：本机锁屏 / 解锁事件通过 MQTT 通知同组设备（其他设备跟随锁屏 / 唤醒屏幕） */
+  lockSync: boolean;
   /** 开机自动启动（持久化意图；由应用启动时与系统实际状态对齐） */
   autoStart: boolean;
   /** 文件中转站（MinIO）配置 */

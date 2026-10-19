@@ -124,10 +124,10 @@ pub fn in_cooldown(last_lock_ms: i64, now: i64) -> bool {
     now - last_lock_ms < LOCK_COOLDOWN_MS
 }
 
-/// 锁定屏幕，返回实际使用的锁定方式（供日志）。
+/// 锁定屏幕，返回实际使用的锁定方式（供日志）。lock_sync 远端锁屏事件同样复用此链路。
 /// 链路：系统锁屏接口（真锁屏，无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ pmset 息屏（需「唤醒时需要密码」），
 /// 逐级降级，每一级的失败原因都记 WARN（便于排查"为什么没锁住"）。
-fn lock_screen(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn lock_screen(app: &AppHandle) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         let mut errors = Vec::new();
@@ -184,8 +184,8 @@ fn lock_screen(app: &AppHandle) -> Result<String, String> {
     }
 }
 
-/// 执行命令并要求退出成功，失败时带上 stderr（供日志诊断）
-fn run_and_check(program: &str, args: &[&str]) -> Result<(), String> {
+/// 执行命令并要求退出成功，失败时带上 stderr（供日志诊断；lock_sync 唤醒屏幕复用）
+pub(crate) fn run_and_check(program: &str, args: &[&str]) -> Result<(), String> {
     let out = std::process::Command::new(program)
         .args(args)
         .output()
@@ -567,17 +567,17 @@ fn build_report(input: &SelfCheckInput) -> LockReport {
     }
 }
 
-/// 打开系统框架（dlopen），失败返回 None
+/// 打开系统框架（dlopen），失败返回 None（lock_sync 锁屏状态检测复用）
 #[cfg(target_os = "macos")]
-fn open_framework(path: &str) -> Option<*mut libc::c_void> {
+pub(crate) fn open_framework(path: &str) -> Option<*mut libc::c_void> {
     let path = std::ffi::CString::new(path).ok()?;
     let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
     if handle.is_null() { None } else { Some(handle) }
 }
 
-/// dlsym 取符号，失败返回 None
+/// dlsym 取符号，失败返回 None（lock_sync 锁屏状态检测复用）
 #[cfg(target_os = "macos")]
-fn dlsym_checked(handle: *mut libc::c_void, symbol: &str) -> Option<*mut libc::c_void> {
+pub(crate) fn dlsym_checked(handle: *mut libc::c_void, symbol: &str) -> Option<*mut libc::c_void> {
     let symbol = std::ffi::CString::new(symbol).ok()?;
     let func = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
     if func.is_null() { None } else { Some(func) }

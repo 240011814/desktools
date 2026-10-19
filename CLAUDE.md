@@ -89,6 +89,7 @@ desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS 
 - **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件（删除前弹窗确认），bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。支持拖拽文件到页面直接上传与「粘贴图片」（截图 / 复制图片后一键转 PNG 上传；也可 Ctrl+V）。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
 - **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。**启动时做锁屏能力自检**（SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），结果记日志并在设置页展示。
+- **锁屏同步**（可选开关，`config.json` 的 `lockSync`，默认关闭）：同一 Group 的设备间同步锁屏状态——本机锁屏（含离人自动锁屏触发的）→ 发布 `lock` 到 `locksync/<group号>`，其他设备复用上述锁屏链路跟随锁定；本机解锁 → 发布 `unlock`，其他设备唤醒屏幕到锁屏界面（远程**不会、也不应**绕过密码真正解锁）。本机状态约 1s 轮询检测（macOS `CGSessionCopyCurrentDictionary` 的 `CGSSessionScreenIsLocked`；Windows `OpenInputDesktop` 拒绝访问 = 已锁），仅状态跃迁时发布、启动/开关开启只建立基准不补发；应用远端锁屏后进入 5s 抑制窗口（防回环），关闭时不订阅、不发布、不处理事件。
 - **系统集成**：桌面右键菜单弹出历史 / 文件中转站小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow，两条目统一开关管理）；托盘右键菜单含「剪贴板历史 / 文件中转站 / 显示主窗口 / 退出」。
 - **其他**：开机自启（意图持久化到 `config.json` 的 `autoStart`，启动时与系统状态对齐；`--hidden` 仅托盘、debug 构建不管理）、关闭最小化到托盘、minisign 验签自动更新（版本号 `1.0.<git 提交数>`）。
 
@@ -129,12 +130,13 @@ src/                          # Vue 3 前端
     FileHubPage.vue           # 文件中转站（MinIO 上传 / 下载 / 删除 + 拖拽 / 粘贴图片上传 + 传输进度，compact 属性 = 小窗口紧凑布局）
     LogPage.vue               # 运行日志（级别筛选 / 刷新 / 清空）
     UpdatePage.vue            # 软件更新检测与安装
-    SettingsPage.vue          # 系统设置：MQTT 同步配置 + 文件中转站（MinIO）+ 桌面右键集成 + 开机自启
+    SettingsPage.vue          # 系统设置：MQTT 同步配置 + 文件中转站（MinIO）+ 离人自动锁屏 + 锁屏同步 + 桌面右键集成 + 开机自启
     ConfirmDialog.vue         # 通用确认弹窗（删除 / 清空等不可逆操作；替代原两段式点击确认）
 src-tauri/
   src/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --files / --hidden）
     auto_lock.rs              # 离人自动锁屏：csi/notify 的 leave/approach 事件 → 延迟锁屏/取消（冷却 60s）+ 锁屏能力自检
+    lock_sync.rs              # 锁屏同步：本机锁屏状态轮询 → locksync/<group> 发布 lock/unlock；远端事件 → 跟随锁屏 / 唤醒屏幕（5s 抑制窗口防回环）
     autostart.rs              # 开机自启：config.json 的 autoStart 意图持久化 + 启动时与系统状态对齐（dev 构建跳过）
     clipboard.rs              # 剪贴板统一入口：自持 arboard 单例（读文本/图片，写后读回校验 + 竞争重试）
     config.rs                 # MqttConfig / MinioConfig 持久化（config.json）与校验、MinIO 地址容错解析、bucket 名校验
@@ -175,5 +177,7 @@ src-tauri/
 - **拖拽上传与剪贴板图片上传**（FileHubPage / file_hub.rs）：窗口 `dragDropEnabled` 默认 `true`（原生接管文件拖放，会禁用 webview 的 HTML5 dnd），前端用 `getCurrentWindow().onDragDropEvent`（底层是 `core:event|listen`，窗口需在 capability `windows` 列表里）拿 `enter/over/drop/leave` + 文件路径。剪贴板图片在 Rust 侧用 `clipboard::read_image()` 读取（自持 arboard 实例，arboard 需启用 `image-data` feature），RGBA 数据在 `spawn_blocking` 里用 `png` crate 编码为 PNG 再走 `put_object_stream_with_content_type` 上传（图片小、不发进度事件）；前端 Ctrl+V 只在剪贴板没有文本时接管，避免拦截正常粘贴。
 - **剪贴板内容识别与快捷操作**（`src/detect.ts` / `src/markdown.ts` / HistoryPage.vue）：识别是前端纯函数（`scripts/detect.test.ts` 用 Node 内置 test runner 覆盖，`pnpm test:unit`），失败一律归「纯文本」不显示徽标。快捷操作全部点击触发：链接 / 邮箱 / 电话走 opener 插件的 `openUrl`（`opener:default` 默认放行 http / https / mailto / tel），路径走 `revealItemInDir`（`~` 用 `homeDir()` 展开）；JSON / Base64 / Markdown 在页面内预览弹层展示（Markdown 渲染先整体转义再生成白名单标签，链接只生成 data-url 由点击拦截走 openUrl，避免注入和 webview 内导航）。算式用自写递归下降解析器（不用 eval / new Function），只接受数字与 `+ - * / % ^ ( )`；识别顺序单行是 链接→邮箱→电话→颜色→JSON→路径→Base64→算式→Markdown，多行是 JSON→Markdown→Base64，改动时注意别让 `#fff`（颜色）撞 Markdown 标题、日期（2023-01-01）撞电话 / 算式这类误判。
 - **不可逆操作确认统一走 `ConfirmDialog`**（文件中转站删除文件 / 历史一键清空 / 日志清空）：overlay + 取消按钮 / 点遮罩 / Esc 关闭，确认按钮 busy 态（「删除中…」）防重复点击、busy 期间不可关闭；旧的「点击变确认按钮」两段式逻辑（deleteArmed / confirmClear + 3 秒计时）已全部移除，不要再新增该模式。删除/清空成功用 toast 反馈（FileHubPage 此前没有 toast，随本次一并加入）。
+- **锁屏同步**（`lock_sync.rs`）：topic `locksync/<group号>`，消息 `{"type":"lock"|"unlock","deviceId","ts"}`（QoS 1、不带 retain，瞬时事件不做离线补发）。本机检测为 1s 轮询：macOS dlopen CoreGraphics/CoreFoundation 调 `CGSessionCopyCurrentDictionary` 读 `CGSSessionScreenIsLocked`（键缺失/非 CFBoolean 按未锁）；Windows `OpenInputDesktop`（`ERROR_ACCESS_DENIED` = 已锁）。仅状态跃迁时发布，启动/开关开启只建立基准不补发；MQTT 未连接时状态变化不发布也不排队。远端 `lock` 复用 `auto_lock::lock_screen`（降级链路与日志完全一致，重复锁定事件会被「已锁定」检查跳过），远端 `unlock` 只唤醒屏幕（macOS `caffeinate -u -t 1`；Windows 广播 `SC_MONITORPOWER -1` + `ES_DISPLAY_REQUIRED`）——**不能也不应绕过密码**，这是功能边界不是缺陷。防回环：忽略自身 deviceId + 应用远端锁屏后 5s 抑制窗口（`REMOTE_SUPPRESS_MS`，一次性标记、状态不匹配即消费）；改检测/发布逻辑时先读 `LockSyncState` 的注释。开关 `lockSync` 默认关闭，关闭时不订阅、不发布、不处理；Windows FFI 只用 `cfg(windows)` 的 `windows-sys`（新增依赖注意 cross-check 方法见下）。
+- **Windows FFI 改动怎么验证**：`cargo check --target x86_64-pc-windows-msvc` 在本机（macOS）会卡在 `aws-lc-sys` 的 C 工具链（无 Windows clang/cc），验证不了应用代码；把改动的 FFI 代码摘到临时 crate（`windows-sys` 同版本）再 `cargo check --target x86_64-pc-windows-msvc` 可以拿到真实编译结果，最终仍以 CI（windows job）为准。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

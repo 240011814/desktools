@@ -12,6 +12,7 @@ use crate::auto_lock::{self, AutoLockState};
 use crate::clipboard;
 use crate::config::MqttConfig;
 use crate::history::{now_ms, HistoryState};
+use crate::lock_sync::{self, LockSyncState};
 use crate::logger::{self, ERROR, INFO, WARN};
 
 /// 前端监听的连接状态事件
@@ -47,6 +48,8 @@ pub enum QueuedMsg {
     Clip(String),
     /// CSI 人体感知消息（csi/notify，自动锁屏用）
     Csi(String),
+    /// 锁屏同步消息（locksync/<group>）
+    LockSync(String),
 }
 /// 本机发布内容的回流识别：只保留最近若干条、数十秒内有效。
 /// 回流链路 = 本机发布 → 对端收到（网络延迟）→ 对端监听线程周期（≤700ms）→ 回发 → 本机收到，
@@ -226,6 +229,18 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                                 format!("自动锁屏已开启，已订阅 {}", auto_lock::CSI_NOTIFY_TOPIC),
                             );
                         }
+                        // 锁屏同步开启时，额外订阅 locksync/<group>
+                        if cfg.lock_sync {
+                            let lock_topic = lock_sync::topic(&cfg.group);
+                            let _ = client
+                                .subscribe(lock_topic.clone(), QoS::AtLeastOnce)
+                                .await;
+                            logger::log(
+                                &app,
+                                INFO,
+                                format!("锁屏同步已开启，已订阅 {lock_topic}"),
+                            );
+                        }
                     }
                     set_status(&app, "connected", "已连接", topic.clone());
                 }
@@ -259,6 +274,8 @@ fn handle_incoming(app: &AppHandle, topic: &str, payload: &[u8]) {
     let raw = String::from_utf8_lossy(payload).to_string();
     let msg = if topic == auto_lock::CSI_NOTIFY_TOPIC {
         QueuedMsg::Csi(raw)
+    } else if topic == lock_sync::topic(&current_group(app)) {
+        QueuedMsg::LockSync(raw)
     } else {
         QueuedMsg::Clip(raw)
     };
@@ -280,6 +297,9 @@ pub fn spawn_message_worker(app: AppHandle) {
                 match msg {
                     QueuedMsg::Clip(raw) => process_incoming(&app, &raw),
                     QueuedMsg::Csi(raw) => app.state::<AutoLockState>().handle_event(&app, &raw),
+                    QueuedMsg::LockSync(raw) => {
+                        app.state::<LockSyncState>().handle_event(&app, &raw)
+                    }
                 }
             }
         });
@@ -352,6 +372,15 @@ fn current_device_id(app: &AppHandle) -> String {
         .lock()
         .unwrap()
         .device_id
+        .clone()
+}
+
+fn current_group(app: &AppHandle) -> String {
+    app.state::<SyncState>()
+        .config
+        .lock()
+        .unwrap()
+        .group
         .clone()
 }
 
@@ -429,9 +458,11 @@ mod tests {
         let sync = SyncState::new(MqttConfig::default());
         sync.enqueue_incoming(QueuedMsg::Clip("first".into())).unwrap();
         sync.enqueue_incoming(QueuedMsg::Csi("second".into())).unwrap();
+        sync.enqueue_incoming(QueuedMsg::LockSync("third".into())).unwrap();
         let rx = sync.take_incoming_receiver().unwrap();
         assert_eq!(rx.recv().unwrap(), QueuedMsg::Clip("first".into()));
         assert_eq!(rx.recv().unwrap(), QueuedMsg::Csi("second".into()));
+        assert_eq!(rx.recv().unwrap(), QueuedMsg::LockSync("third".into()));
         // 接收端只能取一次
         assert!(sync.take_incoming_receiver().is_none());
     }

@@ -57,6 +57,7 @@ const form = reactive<MqttConfig>({
   deviceId: "",
   autoLock: false,
   autoLockDelaySecs: 5,
+  lockSync: false,
   autoStart: true,
   minio: { host: "", port: 9000, bucket: "hub", tls: false, accessKey: "", secretKey: "" },
 });
@@ -166,6 +167,36 @@ async function saveAutoLock(prev?: boolean) {
     if (prev !== undefined) form.autoLock = prev; // 保存失败时开关回退
   } finally {
     autoLockBusy.value = false;
+  }
+}
+
+/* ---------------- 锁屏同步 ---------------- */
+const lockSyncTopic = computed(() => `locksync/${form.group.trim() || "<group号>"}`);
+const lockSyncBusy = ref(false);
+const lockSyncError = ref("");
+const lockSyncSaved = ref(false);
+
+async function toggleLockSync() {
+  const prev = form.lockSync;
+  form.lockSync = !prev;
+  await saveLockSync(prev);
+}
+
+async function saveLockSync(prev?: boolean) {
+  if (lockSyncBusy.value) return;
+  lockSyncBusy.value = true;
+  lockSyncError.value = "";
+  lockSyncSaved.value = false;
+  try {
+    const saved = await invoke<MqttConfig>("save_mqtt_config", { cfg: { ...form } });
+    Object.assign(form, saved);
+    lockSyncSaved.value = true;
+    setTimeout(() => (lockSyncSaved.value = false), 4000);
+  } catch (e) {
+    lockSyncError.value = String(e);
+    if (prev !== undefined) form.lockSync = prev; // 保存失败时开关回退
+  } finally {
+    lockSyncBusy.value = false;
   }
 }
 
@@ -492,6 +523,33 @@ onMounted(() => {
           <li v-for="detail in lockReport.details" :key="detail">{{ detail }}</li>
         </ul>
       </div>
+    </section>
+
+    <!-- 锁屏同步 -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>锁屏同步</h2>
+          <p class="card-sub">订阅 {{ lockSyncTopic }}：一台设备锁屏 / 解锁时通知同组其他设备</p>
+        </div>
+      </div>
+      <label class="switch" :class="{ disabled: lockSyncBusy }">
+        <input
+          type="checkbox"
+          :checked="form.lockSync"
+          :disabled="lockSyncBusy"
+          @change="toggleLockSync"
+        />
+        <span class="track"><span class="thumb"></span></span>
+        <span class="switch-text">开启锁屏同步</span>
+      </label>
+      <p v-if="lockSyncError" class="hint err">{{ lockSyncError }}</p>
+      <p v-else-if="lockSyncSaved" class="hint ok">锁屏同步设置已保存</p>
+      <p v-else class="hint">
+        <b>本机锁屏 → 同组设备一起锁屏；本机解锁 → 其他设备屏幕亮起</b>
+        （停在锁屏界面，需输入密码才能进入，不会绕过密码）。需先配置并保存上方 MQTT 连接，
+        且两台设备都开启此开关；关闭后不再收发锁屏事件。
+      </p>
     </section>
 
     <!-- 启动 -->

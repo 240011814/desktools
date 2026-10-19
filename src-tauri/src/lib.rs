@@ -8,6 +8,7 @@ mod clipboard;
 mod config;
 mod file_hub;
 mod history;
+mod lock_sync;
 mod logger;
 mod mqtt;
 mod secret;
@@ -480,6 +481,7 @@ pub fn run() {
             app.manage(SyncState::new(cfg.clone()));
             app.manage(HistoryState::load(config::history_path(app.handle())));
             app.manage(auto_lock::AutoLockState::default());
+            app.manage(lock_sync::LockSyncState::default());
             let log_path = app
                 .path()
                 .app_log_dir()
@@ -515,6 +517,10 @@ pub fn run() {
             // 监听本机复制的文本，自动发布到同步 topic
             #[cfg(desktop)]
             mqtt::spawn_clipboard_watcher(app.handle().clone());
+
+            // 监听本机锁屏 / 解锁状态，发布到 locksync/<group>（开关开启时生效）
+            #[cfg(desktop)]
+            lock_sync::spawn_watcher(app.handle().clone());
 
             // 开机自启：按 config.json 的 autoStart 意图与系统实际状态对齐（仅打包构建管理，
             // debug 构建跳过，避免把自启条目指向 target/debug 二进制）
