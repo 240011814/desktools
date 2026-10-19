@@ -3,17 +3,19 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { LogEntry, LogLevel } from "../store";
+import { useToast } from "../toast";
 import ConfirmDialog from "./ConfirmDialog.vue";
 
 const LEVELS: Array<LogLevel | "ALL"> = ["ALL", "INFO", "WARN", "ERROR"];
 
 const entries = ref<LogEntry[]>([]);
 const filter = ref<LogLevel | "ALL">("ALL");
-const toast = ref("");
+const { toast, showToast } = useToast();
 const confirmClearOpen = ref(false);
 const clearing = ref(false);
-let toastTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
+/** log://changed 触发的防抖刷新句柄 */
+let scheduleTimer: number | undefined;
 
 const filtered = computed(() =>
   filter.value === "ALL"
@@ -29,10 +31,16 @@ async function load() {
   }
 }
 
-function showToast(text: string) {
-  toast.value = text;
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (toast.value = ""), 1800);
+/**
+ * 事件驱动的刷新防抖：日志是高频产生的（MQTT 重连风暴、每次复制多条），
+ * 每条一条 log://changed 都整份 IPC 拷贝 1000 条会把页面拖卡。
+ * 400ms 内的多条变更只触发一次全量拉取；手动「刷新」按钮仍即时执行。
+ */
+function scheduleLoad() {
+  clearTimeout(scheduleTimer);
+  scheduleTimer = window.setTimeout(() => {
+    void load();
+  }, 400);
 }
 
 /** 弹窗确认后清空全部日志 */
@@ -61,7 +69,7 @@ function formatTime(ts: number): string {
 onMounted(async () => {
   await load();
   try {
-    unlisten = await listen("log://changed", () => load());
+    unlisten = await listen("log://changed", () => scheduleLoad());
   } catch {
     /* ignore */
   }
@@ -69,7 +77,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlisten?.();
-  clearTimeout(toastTimer);
+  clearTimeout(scheduleTimer);
 });
 </script>
 
@@ -107,7 +115,11 @@ onUnmounted(() => {
       </div>
 
       <div v-if="filtered.length" class="log-list">
-        <div v-for="(entry, index) in filtered" :key="index" class="log-item">
+        <div
+          v-for="(entry, index) in filtered"
+          :key="`${entry.ts}-${entry.level}-${index}`"
+          class="log-item"
+        >
           <span class="log-time">{{ formatTime(entry.ts) }}</span>
           <span class="badge" :class="entry.level.toLowerCase()">{{ entry.level }}</span>
           <span class="log-msg">{{ entry.message }}</span>
@@ -232,18 +244,5 @@ onUnmounted(() => {
   min-width: 0;
   word-break: break-all;
   user-select: text;
-}
-
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 34px;
-  transform: translateX(-50%);
-  padding: 8px 18px;
-  border-radius: 999px;
-  background: var(--text);
-  color: var(--bg-elevated);
-  font-size: 0.82rem;
-  box-shadow: var(--shadow);
 }
 </style>

@@ -83,6 +83,25 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      # 发布前同样过一遍质量门禁（CI 只覆盖 develop/PR，main 的发布由本 workflow 负责）
+      - name: Frontend lint
+        run: pnpm lint
+
+      - name: Frontend unit tests
+        run: pnpm test:unit
+
+      - name: Rust fmt check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Rust clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Build and publish to GitHub Releases
         uses: tauri-apps/tauri-action@v0
         env:

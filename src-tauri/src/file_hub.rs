@@ -14,10 +14,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+use s3::BucketConfiguration;
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
-use s3::BucketConfiguration;
 
 use crate::config::MinioConfig;
 use crate::logger::{self, INFO, WARN};
@@ -73,8 +73,14 @@ fn make_bucket(cfg: &MinioConfig) -> Result<(Box<Bucket>, Region, Credentials), 
         region: REGION.to_string(),
         endpoint: format!("{scheme}://{}:{}", cfg.host, cfg.port),
     };
-    let creds = Credentials::new(Some(&cfg.access_key), Some(&cfg.secret_key), None, None, None)
-        .map_err(|e| format!("凭据无效：{e}"))?;
+    let creds = Credentials::new(
+        Some(&cfg.access_key),
+        Some(&cfg.secret_key),
+        None,
+        None,
+        None,
+    )
+    .map_err(|e| format!("凭据无效：{e}"))?;
     let bucket = Bucket::new(&cfg.bucket, region.clone(), creds.clone())
         .map_err(|e| format!("初始化 MinIO 客户端失败：{e}"))?
         .with_path_style();
@@ -104,9 +110,7 @@ async fn ensure_bucket(cfg: &MinioConfig, app: &AppHandle) -> Result<Box<Bucket>
             );
             Ok(bucket)
         }
-        Ok(resp)
-            if resp.response_code == 409 || resp.response_text.contains("BucketAlready") =>
-        {
+        Ok(resp) if resp.response_code == 409 || resp.response_text.contains("BucketAlready") => {
             Ok(bucket)
         }
         Ok(resp) => Err(format!(
@@ -118,24 +122,54 @@ async fn ensure_bucket(cfg: &MinioConfig, app: &AppHandle) -> Result<Box<Bucket>
     }
 }
 
-/// 列出 bucket 内全部文件（过滤“文件夹”占位对象，按修改时间倒序）
+/// 单次刷新最多拉取的列举分页数（S3 每页 ≤1000 个对象，即 ≤2 万个文件）。
+/// 防御性上限：超大 bucket 时刷新不再是分钟级黑盒；达到上限记 WARN。
+const MAX_LIST_PAGES: usize = 20;
+
+/// 列出 bucket 内文件（过滤“文件夹”占位对象，按修改时间倒序；分页拉取，见 MAX_LIST_PAGES）
 pub async fn list(app: &AppHandle, cfg: &MinioConfig) -> Result<Vec<HubFile>, String> {
     require_configured(cfg)?;
     let bucket = ensure_bucket(cfg, app).await?;
-    let pages = bucket
-        .list(String::new(), None)
-        .await
-        .map_err(|e| format!("读取文件列表失败：{e}"))?;
-    let mut files: Vec<HubFile> = pages
-        .iter()
-        .flat_map(|page| page.contents.iter())
-        .filter(|obj| !obj.key.is_empty() && !obj.key.ends_with('/'))
-        .map(|obj| HubFile {
-            key: obj.key.clone(),
-            size: obj.size,
-            last_modified: obj.last_modified.clone(),
-        })
-        .collect();
+    let mut files: Vec<HubFile> = Vec::new();
+    let mut continuation: Option<String> = None;
+    for _ in 0..MAX_LIST_PAGES {
+        let (page, status) = bucket
+            .list_page(String::new(), None, continuation, None, None)
+            .await
+            .map_err(|e| format!("读取文件列表失败：{e}"))?;
+        if status >= 300 {
+            // rust-s3 的 list_page 用 response_data(false)，HTTP 4xx 不返回 Err（见 CLAUDE.md）
+            return Err(format!("读取文件列表失败（HTTP {status}）"));
+        }
+        files.extend(page.contents.iter().filter_map(|obj| {
+            if obj.key.is_empty() || obj.key.ends_with('/') {
+                None
+            } else {
+                Some(HubFile {
+                    key: obj.key.clone(),
+                    size: obj.size,
+                    last_modified: obj.last_modified.clone(),
+                })
+            }
+        }));
+        if !page.is_truncated {
+            continuation = None;
+            break;
+        }
+        continuation = page.next_continuation_token;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    if continuation.is_some() {
+        logger::log(
+            app,
+            WARN,
+            format!(
+                "文件中转站：文件数超过单次刷新上限（{MAX_LIST_PAGES} 页），本轮只显示已拉取到的部分",
+            ),
+        );
+    }
     files.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     Ok(files)
 }
@@ -175,9 +209,7 @@ pub async fn upload(
         .await;
     match result {
         Ok(resp) if resp.status_code() < 300 => {
-            emit_progress(
-                app, transfer_id, &key, "upload", "done", total, total, None,
-            );
+            emit_progress(app, transfer_id, &key, "upload", "done", total, total, None);
             Ok(key)
         }
         Ok(resp) => {
@@ -261,9 +293,7 @@ fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, Stri
         writer
             .write_image_data(rgba)
             .map_err(|e| format!("编码 PNG 失败：{e}"))?;
-        writer
-            .finish()
-            .map_err(|e| format!("编码 PNG 失败：{e}"))?;
+        writer.finish().map_err(|e| format!("编码 PNG 失败：{e}"))?;
     }
     Ok(out)
 }
@@ -308,12 +338,12 @@ pub async fn download(
     }
     let total = head.content_length.unwrap_or(0).max(0) as u64;
 
-    if let Some(dir) = std::path::Path::new(target_path).parent() {
-        if !dir.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(|e| format!("创建目录失败：{e}"))?;
-        }
+    if let Some(dir) = std::path::Path::new(target_path).parent()
+        && !dir.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("创建目录失败：{e}"))?;
     }
     let file = tokio::fs::File::create(target_path)
         .await
@@ -347,7 +377,16 @@ pub async fn download(
                 );
                 return Err(message);
             }
-            emit_progress(app, transfer_id, key, "download", "done", total, total, None);
+            emit_progress(
+                app,
+                transfer_id,
+                key,
+                "download",
+                "done",
+                total,
+                total,
+                None,
+            );
             Ok(())
         }
         Ok(status) => {
@@ -402,19 +441,14 @@ pub async fn delete(app: &AppHandle, cfg: &MinioConfig, key: &str) -> Result<(),
     Ok(())
 }
 
-/// 测试连接：确保 bucket 可用并返回一句话结果（设置页展示）
+/// 测试连接：确保 bucket 可用并返回一句话结果（设置页展示）。
+/// 探活已由 ensure_bucket 内的 list_page(max-keys=1) 完成，不再全量列举数文件
+/// ——大 bucket 时那个「共 N 个文件」会把保存前的验证拖到分钟级。
 pub async fn test_connection(app: &AppHandle, cfg: &MinioConfig) -> Result<String, String> {
     require_configured(cfg)?;
     let bucket_name = cfg.normalized().bucket;
-    let bucket = ensure_bucket(cfg, app).await?;
-    let pages = bucket
-        .list(String::new(), None)
-        .await
-        .map_err(|e| format!("列举文件失败：{e}"))?;
-    let count: usize = pages.iter().map(|page| page.contents.len()).sum();
-    Ok(format!(
-        "连接成功：bucket「{bucket_name}」可用，当前共有 {count} 个文件"
-    ))
+    ensure_bucket(cfg, app).await?;
+    Ok(format!("连接成功：bucket「{bucket_name}」可用"))
 }
 
 /// 删除下载中断产生的不完整文件（best-effort，失败只记日志）
@@ -463,11 +497,7 @@ fn object_key_from_path(path: &str) -> Result<String, String> {
 
 /// 按扩展名猜 Content-Type（未知类型用 application/octet-stream）
 fn guess_content_type(name: &str) -> &'static str {
-    let ext = name
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -629,10 +659,7 @@ mod tests {
         assert_eq!(guess_content_type("a.png"), "image/png");
         assert_eq!(guess_content_type("A.JPEG"), "image/jpeg");
         assert_eq!(guess_content_type("notes.md"), "text/plain; charset=utf-8");
-        assert_eq!(
-            guess_content_type("noext"),
-            "application/octet-stream"
-        );
+        assert_eq!(guess_content_type("noext"), "application/octet-stream");
     }
 
     #[test]
@@ -699,7 +726,11 @@ mod tests {
             .put_object_stream_with_content_type(&mut cursor, &key, "text/plain")
             .await
             .unwrap();
-        assert!(resp.status_code() < 300, "上传状态码 {}", resp.status_code());
+        assert!(
+            resp.status_code() < 300,
+            "上传状态码 {}",
+            resp.status_code()
+        );
 
         let pages = bucket.list(String::new(), None).await.unwrap();
         assert!(
@@ -714,6 +745,10 @@ mod tests {
         assert_eq!(data.bytes().as_ref(), b"hello-desktools".as_slice());
 
         let resp = bucket.delete_object(&key).await.unwrap();
-        assert!(resp.status_code() < 300, "删除状态码 {}", resp.status_code());
+        assert!(
+            resp.status_code() < 300,
+            "删除状态码 {}",
+            resp.status_code()
+        );
     }
 }

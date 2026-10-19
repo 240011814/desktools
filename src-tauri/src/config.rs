@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
+use crate::fs_atomic;
 use crate::secret;
 
 /// MinIO 默认存储桶名（bucket 可配置，留空 / 旧配置缺字段时回落该值）
@@ -132,12 +133,11 @@ fn split_host_port(input: &str) -> (String, Option<u16>) {
         return (input.to_string(), None);
     }
     // 只有一个冒号才视为 host:port（无括号的 IPv6 地址原样保留）
-    if input.matches(':').count() == 1 {
-        if let Some((host, port)) = input.split_once(':') {
-            if let Ok(port) = port.parse::<u16>() {
-                return (host.to_string(), Some(port));
-            }
-        }
+    if input.matches(':').count() == 1
+        && let Some((host, port)) = input.split_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.to_string(), Some(port));
     }
     (input.to_string(), None)
 }
@@ -220,9 +220,12 @@ impl MqttConfig {
         if config.device_id.trim().is_empty() {
             config.device_id = uuid::Uuid::new_v4().to_string();
         }
-        // MinIO 凭据落盘时加密：解密失败（换机器 / 文件被改）按空串处理，表现为需重新填写
+        // 凭据落盘时加密：解密失败（换机器 / 文件被改）按空串处理，表现为需重新填写。
+        // MinIO Access / Secret Key：
         config.minio.access_key = secret::decrypt(&config.minio.access_key).unwrap_or_default();
         config.minio.secret_key = secret::decrypt(&config.minio.secret_key).unwrap_or_default();
+        // MQTT 密码（无前缀的历史明文原样透传，兼容旧配置）：
+        config.password = secret::decrypt(&config.password).unwrap_or_default();
         config
     }
 
@@ -230,13 +233,15 @@ impl MqttConfig {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("无法创建配置目录：{e}"))?;
         }
-        // MinIO 凭据在写盘前加密（内存与前端接口保持明文）
+        // 凭据在写盘前加密（内存与前端接口保持明文）：MinIO Access / Secret Key、MQTT 密码
         let mut persisted = self.clone();
         persisted.minio.access_key = secret::encrypt(&self.minio.access_key)?;
         persisted.minio.secret_key = secret::encrypt(&self.minio.secret_key)?;
+        persisted.password = secret::encrypt(&self.password)?;
         let text =
             serde_json::to_string_pretty(&persisted).map_err(|e| format!("配置序列化失败：{e}"))?;
-        fs::write(path, text).map_err(|e| format!("无法写入配置文件：{e}"))?;
+        // 原子写盘：进程被杀时不能留下写了一半的 config.json（读回按损坏处理会重置全部配置）
+        fs_atomic::write_text(path, &text).map_err(|e| format!("无法写入配置文件：{e}"))?;
         Ok(())
     }
 
@@ -283,6 +288,10 @@ pub fn history_path(app: &tauri::AppHandle) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    // 测试里按 Default 逐字段赋值是为了直白表达「改这一项」,clippy 建议的
+    // 结构体初始化写法在这里反而降低可读性
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
 
     #[test]
@@ -486,10 +495,50 @@ mod tests {
             secret_key: "SK-plain".into(),
             ..MinioConfig::default()
         };
+        cfg.password = "MQTT-plain".into();
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("AK-plain"));
         assert!(json.contains("SK-plain"));
+        assert!(json.contains("MQTT-plain"));
         assert!(!json.contains("enc:v1:"));
+    }
+
+    #[test]
+    fn mqtt_password_is_encrypted_in_file() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.host = "broker.emqx.io".into();
+        cfg.group = "g1".into();
+        cfg.password = "p@ss w0rd".into();
+        cfg.save(&path).unwrap();
+
+        // 文件内容：明文密码不能出现
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("p@ss w0rd"));
+        assert!(text.contains("enc:v1:"));
+
+        // 读回后恢复明文
+        let loaded = MqttConfig::load(&path);
+        assert_eq!(loaded.password, "p@ss w0rd");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plaintext_password_still_loads() {
+        // 升级前的 config.json 里 password 是明文（无 enc:v1: 前缀）：
+        // MqttConfig::load 走 secret::decrypt 读取，无前缀应按明文透传
+        let legacy = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "u",
+            "password": "old-plain-pass",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1"
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(secret::decrypt(&cfg.password).unwrap(), "old-plain-pass");
     }
 
     #[test]

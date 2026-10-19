@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::auto_lock::{self, AutoLockState};
 use crate::clipboard;
 use crate::config::MqttConfig;
-use crate::history::{now_ms, HistoryState};
+use crate::history::{HistoryState, now_ms};
 use crate::lock_sync::{self, LockSyncState};
 use crate::logger::{self, ERROR, INFO, WARN};
 
@@ -40,6 +40,17 @@ pub struct SyncMessage {
 
 /// 收到消息的内存队列容量（超出后丢弃并记 WARN，避免慢消费拖垮 MQTT 事件循环）
 const INCOMING_QUEUE_CAPACITY: usize = 512;
+
+/// 单条同步文本的字节上限：超限则不同步、不入史。
+///
+/// - 过大 payload 会被 broker 拒收甚至断开连接（EMQX 默认 1MB），表象是复制大段
+///   内容后本机进入无限重连；
+/// - history.json 会随单条记录一起膨胀，历史里也没有任何场景需要放 0.5MB 文本。
+pub const MAX_TEXT_BYTES: usize = 512 * 1024;
+
+/// 入队门槛（对 raw JSON 信封）：超出直接丢弃，不做无谓的解析与内存拷贝。
+/// 文本上限的 4 倍，覆盖 JSON 转义（引号 / 换行 / 控制字符转义与信封字段）的膨胀。
+pub const MAX_PAYLOAD_BYTES: usize = MAX_TEXT_BYTES * 4;
 
 /// 消息队列中的待处理消息（按订阅 topic 分型）
 #[derive(Debug, PartialEq)]
@@ -182,7 +193,12 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
     logger::log(
         &app,
         INFO,
-        format!("开始连接 MQTT {}:{}（订阅 {}）", cfg.host.trim(), cfg.port, topic),
+        format!(
+            "开始连接 MQTT {}:{}（订阅 {}）",
+            cfg.host.trim(),
+            cfg.port,
+            topic
+        ),
     );
 
     tauri::async_runtime::spawn(async move {
@@ -232,14 +248,8 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                         // 锁屏同步开启时，额外订阅 locksync/<group>
                         if cfg.lock_sync {
                             let lock_topic = lock_sync::topic(&cfg.group);
-                            let _ = client
-                                .subscribe(lock_topic.clone(), QoS::AtLeastOnce)
-                                .await;
-                            logger::log(
-                                &app,
-                                INFO,
-                                format!("锁屏同步已开启，已订阅 {lock_topic}"),
-                            );
+                            let _ = client.subscribe(lock_topic.clone(), QoS::AtLeastOnce).await;
+                            logger::log(&app, INFO, format!("锁屏同步已开启，已订阅 {lock_topic}"));
                         }
                     }
                     set_status(&app, "connected", "已连接", topic.clone());
@@ -271,6 +281,19 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
 
 /// 收到消息：按 topic 分型入队，处理交给后台单线程（不在 MQTT 事件循环里做剪贴板/历史/锁屏 IO）
 fn handle_incoming(app: &AppHandle, topic: &str, payload: &[u8]) {
+    // 超大消息在队列门外直接丢弃：解析（from_utf8_lossy 会整份拷贝）和入队都省掉
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        logger::log(
+            app,
+            WARN,
+            format!(
+                "MQTT 消息过大（{} 字节 > {} KB），已丢弃：{topic}",
+                payload.len(),
+                MAX_PAYLOAD_BYTES / 1024
+            ),
+        );
+        return;
+    }
     let raw = String::from_utf8_lossy(payload).to_string();
     let msg = if topic == auto_lock::CSI_NOTIFY_TOPIC {
         QueuedMsg::Csi(raw)
@@ -310,6 +333,19 @@ fn process_incoming(app: &AppHandle, raw: &str) {
     let Some(text) = parse_payload(raw, &current_device_id(app)) else {
         return;
     };
+    // 超限的远端内容不写剪贴板也不入史（正常情况下对端的同步上限会先拦住，这里兜底）
+    if is_oversized_text(&text) {
+        logger::log(
+            app,
+            WARN,
+            format!(
+                "忽略超大远端内容（{} 字符 > {} KB）",
+                text.chars().count(),
+                MAX_TEXT_BYTES / 1024
+            ),
+        );
+        return;
+    }
 
     let sync = app.state::<SyncState>();
     // 对端防回环失效时，本机发布的内容会被原样回流回来；
@@ -349,6 +385,11 @@ fn process_incoming(app: &AppHandle, raw: &str) {
             ),
         }
     });
+}
+
+/// 超过同步上限的内容（字节数）：超限不同步、不入史，与 history::push 的兜底护栏保持一致
+fn is_oversized_text(text: &str) -> bool {
+    text.len() > MAX_TEXT_BYTES
 }
 
 /// 解析消息内容，返回需要写入剪贴板的文本。
@@ -406,6 +447,23 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                     if text.trim().is_empty() {
                         return;
                     }
+                    // 超限内容不同步也不入史：会撞 broker 报文上限导致断线重连，
+                    // history.json 也会被单条撑大。更新 last_seen 避免每个轮询周期重复告警。
+                    if text.len() > MAX_TEXT_BYTES {
+                        if text != last_seen {
+                            last_seen = text.clone();
+                            logger::log(
+                                &app,
+                                WARN,
+                                format!(
+                                    "复制的内容超过同步上限（{} 字符 > {} KB），不同步也不同入历史",
+                                    text.chars().count(),
+                                    MAX_TEXT_BYTES / 1024
+                                ),
+                            );
+                        }
+                        return;
+                    }
                     let sync = app.state::<SyncState>();
                     if text != last_seen {
                         last_seen = text.clone();
@@ -431,15 +489,14 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                     .to_string();
                     let topic = cfg.topic();
                     tauri::async_runtime::spawn(async move {
-                        let _ = client.publish(topic, QoS::AtLeastOnce, false, payload).await;
+                        let _ = client
+                            .publish(topic, QoS::AtLeastOnce, false, payload)
+                            .await;
                     });
                     logger::log(
                         &app,
                         INFO,
-                        format!(
-                            "已发送同步内容（{} 字符）：{preview}",
-                            text.chars().count()
-                        ),
+                        format!("已发送同步内容（{} 字符）：{preview}", text.chars().count()),
                     );
                     *last_clip.lock().unwrap() = text.clone();
                     // 记录已发布内容：对端把它原样回流回来时直接忽略
@@ -456,9 +513,12 @@ mod tests {
     #[test]
     fn queues_incoming_messages_in_order() {
         let sync = SyncState::new(MqttConfig::default());
-        sync.enqueue_incoming(QueuedMsg::Clip("first".into())).unwrap();
-        sync.enqueue_incoming(QueuedMsg::Csi("second".into())).unwrap();
-        sync.enqueue_incoming(QueuedMsg::LockSync("third".into())).unwrap();
+        sync.enqueue_incoming(QueuedMsg::Clip("first".into()))
+            .unwrap();
+        sync.enqueue_incoming(QueuedMsg::Csi("second".into()))
+            .unwrap();
+        sync.enqueue_incoming(QueuedMsg::LockSync("third".into()))
+            .unwrap();
         let rx = sync.take_incoming_receiver().unwrap();
         assert_eq!(rx.recv().unwrap(), QueuedMsg::Clip("first".into()));
         assert_eq!(rx.recv().unwrap(), QueuedMsg::Csi("second".into()));
@@ -512,5 +572,28 @@ mod tests {
     fn ignores_empty_text() {
         let payload = r#"{"deviceId":"other","text":"","ts":1}"#;
         assert_eq!(parse_payload(payload, "me"), None);
+    }
+
+    #[test]
+    fn oversized_text_is_detected() {
+        let small = "a".repeat(MAX_TEXT_BYTES);
+        let big = "a".repeat(MAX_TEXT_BYTES + 1);
+        assert!(!is_oversized_text(&small));
+        assert!(is_oversized_text(&big));
+    }
+
+    #[test]
+    fn payload_cap_admits_text_up_to_sync_limit() {
+        // 合法上限内的文本（含全换行这类转义膨胀最大的输入），其 JSON 信封
+        // 不应超过入队门槛——否则「同步上限内」的文本会在队列门外被误丢。
+        let text = "\n".repeat(MAX_TEXT_BYTES);
+        let payload = serde_json::json!({ "deviceId": "d", "text": text, "ts": 0 }).to_string();
+        assert!(
+            payload.len() <= MAX_PAYLOAD_BYTES,
+            "payload {} > {}",
+            payload.len(),
+            MAX_PAYLOAD_BYTES
+        );
+        assert!(payload.len() > MAX_PAYLOAD_BYTES / 2); // 门槛确实兜住了转义膨胀
     }
 }

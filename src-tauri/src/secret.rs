@@ -9,10 +9,10 @@
 
 use std::sync::OnceLock;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
-use ring::hkdf::{KeyType, Salt, HKDF_SHA256};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::hkdf::{HKDF_SHA256, KeyType, Salt};
 use ring::rand::{SecureRandom, SystemRandom};
 
 const PREFIX: &str = "enc:v1:";

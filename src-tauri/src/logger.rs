@@ -75,16 +75,19 @@ impl LogState {
             let _ = fs::create_dir_all(dir);
         }
         // 文件过大时轮转，最多保留 1 个备份
-        if let Ok(meta) = fs::metadata(&self.path) {
-            if meta.len() > MAX_FILE_BYTES {
-                let backup = self.path.with_extension("jsonl.old");
-                let _ = fs::rename(&self.path, backup);
-            }
+        if let Ok(meta) = fs::metadata(&self.path)
+            && meta.len() > MAX_FILE_BYTES
+        {
+            let backup = self.path.with_extension("jsonl.old");
+            let _ = fs::rename(&self.path, backup);
         }
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
-            if let Ok(line) = serde_json::to_string(entry) {
-                let _ = writeln!(file, "{line}");
-            }
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            && let Ok(line) = serde_json::to_string(entry)
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 

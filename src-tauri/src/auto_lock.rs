@@ -48,7 +48,11 @@ impl AutoLockState {
     /// 处理一条 csi/notify 消息（由消息处理线程调用）
     pub fn handle_event(&self, app: &AppHandle, raw: &str) {
         let Some(msg) = parse_csi_event(raw) else {
-            logger::log(app, WARN, format!("自动锁屏：无法解析的 CSI 消息：{}", logger::preview(raw)));
+            logger::log(
+                app,
+                WARN,
+                format!("自动锁屏：无法解析的 CSI 消息：{}", logger::preview(raw)),
+            );
             return;
         };
         match msg.event.as_str() {
@@ -60,13 +64,22 @@ impl AutoLockState {
 
     /// 收到 leave：延迟锁屏（期间检测到有人回来则取消）
     fn schedule_lock(&self, app: &AppHandle, device: &str) {
-        let cfg = app.state::<crate::mqtt::SyncState>().config.lock().unwrap().clone();
+        let cfg = app
+            .state::<crate::mqtt::SyncState>()
+            .config
+            .lock()
+            .unwrap()
+            .clone();
         if !cfg.auto_lock {
             return;
         }
         let now = now_ms();
         if in_cooldown(*self.last_lock_ms.lock().unwrap(), now) {
-            logger::log(app, INFO, "自动锁屏：距上次锁屏不足 60 秒，忽略本次离开事件");
+            logger::log(
+                app,
+                INFO,
+                "自动锁屏：距上次锁屏不足 60 秒，忽略本次离开事件",
+            );
             return;
         }
         let delay = cfg.auto_lock_delay_secs.clamp(1, 300);
@@ -76,7 +89,9 @@ impl AutoLockState {
         logger::log(
             app,
             INFO,
-            format!("自动锁屏：设备 {device} 检测到人离开，{delay} 秒后锁屏（期间检测到有人则取消）"),
+            format!(
+                "自动锁屏：设备 {device} 检测到人离开，{delay} 秒后锁屏（期间检测到有人则取消）"
+            ),
         );
 
         let app = app.clone();
@@ -101,7 +116,11 @@ impl AutoLockState {
     fn cancel_pending(&self, app: &AppHandle, device: &str) {
         if self.pending.swap(false, Ordering::SeqCst) {
             self.pending_gen.fetch_add(1, Ordering::SeqCst);
-            logger::log(app, INFO, format!("自动锁屏：设备 {device} 检测到有人回来，已取消待执行的锁屏"));
+            logger::log(
+                app,
+                INFO,
+                format!("自动锁屏：设备 {device} 检测到有人回来，已取消待执行的锁屏"),
+            );
         }
     }
 
@@ -143,10 +162,13 @@ pub(crate) fn lock_screen(app: &AppHandle) -> Result<String, String> {
             }
         }
         // Ctrl+Cmd+Q 系统「锁定屏幕」快捷键（需要辅助功能权限）
-        match run_and_check("osascript", &[
-            "-e",
-            r#"tell application "System Events" to keystroke "q" using {control down, command down}"#,
-        ]) {
+        match run_and_check(
+            "osascript",
+            &[
+                "-e",
+                r#"tell application "System Events" to keystroke "q" using {control down, command down}"#,
+            ],
+        ) {
             Ok(()) => return Ok("系统快捷键 Ctrl+Cmd+Q".into()),
             Err(err) => {
                 logger::log(
@@ -160,7 +182,9 @@ pub(crate) fn lock_screen(app: &AppHandle) -> Result<String, String> {
         // 最后降级：立即息屏；系统设置「唤醒时需要密码」时等效锁屏（无需任何权限）
         match run_and_check("pmset", &["displaysleepnow"]) {
             Ok(()) => {
-                return Ok("pmset displaysleepnow 息屏（等效锁屏，建议开启「唤醒时需要密码」）".into())
+                return Ok(
+                    "pmset displaysleepnow 息屏（等效锁屏，建议开启「唤醒时需要密码」）".into(),
+                );
             }
             Err(err) => {
                 logger::log(app, WARN, format!("自动锁屏：息屏降级失败（{err}）"));
@@ -235,7 +259,10 @@ fn sac_load() -> Result<(*mut libc::c_void, unsafe extern "C" fn()), String> {
             libc::dlclose(handle);
             return Err("dlsym SACLockScreenImmediate 失败".into());
         };
-        Ok((handle, std::mem::transmute(func)))
+        Ok((
+            handle,
+            std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn()>(func),
+        ))
     }
 }
 
@@ -334,9 +361,9 @@ pub fn self_check() -> LockReport {
 /// 辅助功能权限（静默检测：AXIsProcessTrusted，不弹窗）
 #[cfg(target_os = "macos")]
 fn accessibility_trusted() -> bool {
-    let Some(handle) =
-        open_framework("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-    else {
+    let Some(handle) = open_framework(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+    ) else {
         return false;
     };
     let trusted = unsafe {
@@ -379,12 +406,13 @@ fn automation_permission() -> AutomationPermission {
     type DisposeDesc = unsafe extern "C" fn(*mut Aedesc) -> i32;
     type DeterminePermission = unsafe extern "C" fn(*const Aedesc, u32, u32, u8) -> i32;
 
-    let Some(handle) =
-        open_framework("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-    else {
+    let Some(handle) = open_framework(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+    ) else {
         return AutomationPermission::Unknown;
     };
-    let result = unsafe {
+
+    unsafe {
         let (Some(create), Some(determine)) = (
             dlsym_checked(handle, "AECreateDesc"),
             dlsym_checked(handle, "AEDeterminePermissionToAutomateTarget"),
@@ -421,8 +449,7 @@ fn automation_permission() -> AutomationPermission {
         };
         libc::dlclose(handle);
         permission
-    };
-    result
+    }
 }
 
 /// 读取「进入睡眠后需要密码」设置（sysadminctl，静默，不需要管理员权限）
@@ -456,10 +483,10 @@ pub fn parse_screen_lock_output(raw: &str) -> ScreenLockSetting {
     }
     if let Some(rest) = raw.split("screenLock delay is ").nth(1) {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() {
-            if let Ok(secs) = digits.parse::<u64>() {
-                return ScreenLockSetting::AfterSeconds(secs);
-            }
+        if !digits.is_empty()
+            && let Ok(secs) = digits.parse::<u64>()
+        {
+            return ScreenLockSetting::AfterSeconds(secs);
         }
     }
     ScreenLockSetting::Unknown
@@ -468,8 +495,7 @@ pub fn parse_screen_lock_output(raw: &str) -> ScreenLockSetting {
 /// 由探测结果生成自检报告（纯逻辑，供测试）
 #[cfg(target_os = "macos")]
 fn build_report(input: &SelfCheckInput) -> LockReport {
-    let keystroke_ok =
-        input.accessibility && input.automation == AutomationPermission::Granted;
+    let keystroke_ok = input.accessibility && input.automation == AutomationPermission::Granted;
     let screen_lock_text = match input.screen_lock {
         ScreenLockSetting::Immediate => "立即".to_string(),
         ScreenLockSetting::AfterSeconds(secs) => format!("{secs} 秒后"),
@@ -484,7 +510,11 @@ fn build_report(input: &SelfCheckInput) -> LockReport {
         },
         format!(
             "辅助功能权限：{}",
-            if input.accessibility { "已授权" } else { "未授权" }
+            if input.accessibility {
+                "已授权"
+            } else {
+                "未授权"
+            }
         ),
         format!(
             "自动化权限（控制 System Events）：{}",
@@ -533,9 +563,8 @@ fn build_report(input: &SelfCheckInput) -> LockReport {
         }
         match input.automation {
             AutomationPermission::Granted => {}
-            AutomationPermission::Denied => {
-                advice.push("在「系统设置 → 隐私与安全性 → 自动化」中允许 desktools 控制「系统事件」")
-            }
+            AutomationPermission::Denied => advice
+                .push("在「系统设置 → 隐私与安全性 → 自动化」中允许 desktools 控制「系统事件」"),
             AutomationPermission::NotAsked => {
                 advice.push("首次触发锁屏时按系统弹窗允许 desktools 控制「系统事件」")
             }
@@ -631,7 +660,11 @@ mod self_check_tests {
     ) -> SelfCheckInput {
         SelfCheckInput {
             sac_available: sac,
-            sac_error: if sac { None } else { Some("dlsym 失败".into()) },
+            sac_error: if sac {
+                None
+            } else {
+                Some("dlsym 失败".into())
+            },
             accessibility,
             automation,
             screen_lock,
@@ -650,9 +683,15 @@ mod self_check_tests {
             parse_screen_lock_output("screenLock delay is immediate"),
             ScreenLockSetting::Immediate
         );
-        assert_eq!(parse_screen_lock_output("screenLock is off"), ScreenLockSetting::Off);
+        assert_eq!(
+            parse_screen_lock_output("screenLock is off"),
+            ScreenLockSetting::Off
+        );
         assert_eq!(parse_screen_lock_output(""), ScreenLockSetting::Unknown);
-        assert_eq!(parse_screen_lock_output("garbage"), ScreenLockSetting::Unknown);
+        assert_eq!(
+            parse_screen_lock_output("garbage"),
+            ScreenLockSetting::Unknown
+        );
     }
 
     #[test]

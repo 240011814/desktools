@@ -60,6 +60,25 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      # 质量门禁：lint / 测试 / 格式 / 静态检查不通过则不构建
+      - name: Frontend lint
+        run: pnpm lint
+
+      - name: Frontend unit tests
+        run: pnpm test:unit
+
+      - name: Rust fmt check
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Rust clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Build Tauri app
         shell: bash
         env:

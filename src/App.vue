@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import type { Component } from "vue";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -38,7 +39,7 @@ const TABS = [
 
 type TabId = (typeof TABS)[number]["id"];
 
-const pages: Record<TabId, unknown> = {
+const pages: Record<TabId, Component> = {
   history: HistoryPage,
   files: FileHubPage,
   log: LogPage,
@@ -68,14 +69,15 @@ onMounted(async () => {
   } catch {
     version.value = "未知";
   }
+  // 先注册事件监听、再拉取当前状态：两次调用之间到达的状态事件不被漏掉
+  listen<MqttStatus>("mqtt://status", (e) => {
+    mqttStatus.value = e.payload;
+  }).catch(() => {});
   try {
     mqttStatus.value = await invoke<MqttStatus>("get_mqtt_status");
   } catch {
     /* ignore */
   }
-  listen<MqttStatus>("mqtt://status", (e) => {
-    mqttStatus.value = e.payload;
-  }).catch(() => {});
   window.addEventListener("hashchange", () => {
     active.value = tabFromHash();
   });

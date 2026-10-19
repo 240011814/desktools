@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use crate::logger::{self, INFO};
+use crate::fs_atomic;
+use crate::logger::{self, ERROR, INFO, WARN};
+use crate::mqtt::MAX_TEXT_BYTES;
 
 /// 前端监听的历史变更事件
 pub const HISTORY_EVENT: &str = "history://changed";
@@ -51,35 +53,54 @@ impl HistoryState {
         }
     }
 
-    fn save(&self, items: &[HistoryItem]) {
+    /// 持久化（原子写盘：写一半被杀也不能把整个 history.json 毁掉）
+    fn save(&self, items: &[HistoryItem]) -> Result<(), std::io::Error> {
         if let Some(dir) = self.path.parent() {
             let _ = fs::create_dir_all(dir);
         }
-        if let Ok(text) = serde_json::to_string_pretty(items) {
-            let _ = fs::write(&self.path, text);
-        }
+        let text = serde_json::to_string_pretty(items)?;
+        fs_atomic::write_text(&self.path, &text)
     }
 
     /// 新增一条记录：相同内容不重复记录（更新时间并置顶），超出上限淘汰最旧
     pub fn push(&self, app: &AppHandle, text: &str, source: &str) {
-        let text = text.trim();
-        if text.is_empty() {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // 超限内容不入史（兜底护栏：调用方 mqtt 已各自拦截，防止 history.json 被单条撑大）
+        if trimmed.len() > MAX_TEXT_BYTES {
+            logger::log(
+                app,
+                WARN,
+                format!(
+                    "内容超过同步上限（{} 字符 > {} KB），不记入历史",
+                    trimmed.chars().count(),
+                    MAX_TEXT_BYTES / 1024
+                ),
+            );
             return;
         }
         {
             let mut items = self.items.lock().unwrap();
-            items.retain(|item| item.text != text);
+            items.retain(|item| item.text != trimmed);
             items.insert(
                 0,
                 HistoryItem {
                     id: uuid::Uuid::new_v4().to_string(),
-                    text: text.to_string(),
+                    text: trimmed.to_string(),
                     source: source.to_string(),
                     ts: now_ms(),
                 },
             );
             items.truncate(HISTORY_LIMIT);
-            self.save(&items);
+            if let Err(err) = self.save(&items) {
+                logger::log(
+                    app,
+                    ERROR,
+                    format!("历史写入文件失败（数据仍在内存中）：{err}"),
+                );
+            }
             logger::log(
                 app,
                 INFO,
@@ -109,7 +130,13 @@ impl HistoryState {
             if items.len() == before {
                 return Err("记录不存在".into());
             }
-            self.save(&items);
+            if let Err(err) = self.save(&items) {
+                logger::log(
+                    app,
+                    ERROR,
+                    format!("历史写入文件失败（数据仍在内存中）：{err}"),
+                );
+            }
             logger::log(app, INFO, "历史记录 -1（手动删除）");
         }
         let _ = app.emit(HISTORY_EVENT, ());
@@ -120,7 +147,13 @@ impl HistoryState {
         {
             let mut items = self.items.lock().unwrap();
             items.clear();
-            self.save(&items);
+            if let Err(err) = self.save(&items) {
+                logger::log(
+                    app,
+                    ERROR,
+                    format!("历史写入文件失败（数据仍在内存中）：{err}"),
+                );
+            }
             logger::log(app, INFO, "历史记录已全部清空");
         }
         let _ = app.emit(HISTORY_EVENT, ());
@@ -153,7 +186,7 @@ mod tests {
                 );
             }
             items.truncate(HISTORY_LIMIT);
-            state.save(&items);
+            state.save(&items).unwrap();
         }
         let loaded = HistoryState::load(dir.join("history.json"));
         assert_eq!(loaded.list().len(), HISTORY_LIMIT);
@@ -189,7 +222,7 @@ mod tests {
                     ts: 1,
                 },
             );
-            state.save(&items);
+            state.save(&items).unwrap();
         }
         let list = state.list();
         assert_eq!(list.len(), 3);
@@ -212,13 +245,13 @@ mod tests {
         {
             let mut items = state.items.lock().unwrap();
             items.retain(|item| item.id != "x");
-            state.save(&items);
+            state.save(&items).unwrap();
         }
         assert!(state.list().is_empty());
         {
             let mut items = state.items.lock().unwrap();
             items.clear();
-            state.save(&items);
+            state.save(&items).unwrap();
         }
         assert!(state.list().is_empty());
     }

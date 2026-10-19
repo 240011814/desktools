@@ -139,35 +139,39 @@ async function testMinioConnection() {
   }
 }
 
-/* ---------------- 离人自动锁屏 ---------------- */
+/* ---------------- 离人自动锁屏 / 锁屏同步（窄接口保存开关） ---------------- */
+/* 开关类设置走 set_auto_lock / set_lock_sync：以持久化配置为基只改目标字段,
+   避免把表单里「已修改但未提交」的 MQTT 其他字段一并写入并重连 */
 const csiTopic = "csi/notify";
 const autoLockBusy = ref(false);
 const autoLockError = ref("");
 const autoLockSaved = ref(false);
 
-async function toggleAutoLock() {
-  const prev = form.autoLock;
-  form.autoLock = !prev;
-  await saveAutoLock(prev);
-}
-
-async function saveAutoLock(prev?: boolean) {
+async function saveAutoLockFlag(enabled = form.autoLock) {
   if (autoLockBusy.value) return;
   autoLockBusy.value = true;
   autoLockError.value = "";
   autoLockSaved.value = false;
   try {
-    form.autoLockDelaySecs = Math.min(300, Math.max(1, Number(form.autoLockDelaySecs) || 5));
-    const saved = await invoke<MqttConfig>("save_mqtt_config", { cfg: { ...form } });
+    form.autoLockDelaySecs = Math.min(300, Math.max(1, Number(form.autoLockDelaySecs) || 15));
+    const saved = await invoke<MqttConfig>("set_auto_lock", {
+      enabled,
+      delaySecs: form.autoLockDelaySecs,
+    });
     Object.assign(form, saved);
     autoLockSaved.value = true;
     setTimeout(() => (autoLockSaved.value = false), 4000);
   } catch (e) {
     autoLockError.value = String(e);
-    if (prev !== undefined) form.autoLock = prev; // 保存失败时开关回退
+    await loadConfig(); // 保存失败回读持久化配置,开关显示与实际状态对齐
   } finally {
     autoLockBusy.value = false;
   }
+}
+
+async function toggleAutoLock() {
+  if (autoLockBusy.value) return;
+  await saveAutoLockFlag(!form.autoLock);
 }
 
 /* ---------------- 锁屏同步 ---------------- */
@@ -176,28 +180,27 @@ const lockSyncBusy = ref(false);
 const lockSyncError = ref("");
 const lockSyncSaved = ref(false);
 
-async function toggleLockSync() {
-  const prev = form.lockSync;
-  form.lockSync = !prev;
-  await saveLockSync(prev);
-}
-
-async function saveLockSync(prev?: boolean) {
+async function saveLockSyncFlag(enabled = form.lockSync) {
   if (lockSyncBusy.value) return;
   lockSyncBusy.value = true;
   lockSyncError.value = "";
   lockSyncSaved.value = false;
   try {
-    const saved = await invoke<MqttConfig>("save_mqtt_config", { cfg: { ...form } });
+    const saved = await invoke<MqttConfig>("set_lock_sync", { enabled });
     Object.assign(form, saved);
     lockSyncSaved.value = true;
     setTimeout(() => (lockSyncSaved.value = false), 4000);
   } catch (e) {
     lockSyncError.value = String(e);
-    if (prev !== undefined) form.lockSync = prev; // 保存失败时开关回退
+    await loadConfig();
   } finally {
     lockSyncBusy.value = false;
   }
+}
+
+async function toggleLockSync() {
+  if (lockSyncBusy.value) return;
+  await saveLockSyncFlag(!form.lockSync);
 }
 
 /* ---------------- 桌面右键菜单集成 ---------------- */
@@ -503,7 +506,7 @@ onMounted(() => {
             min="1"
             max="300"
             placeholder="15"
-            @change="saveAutoLock()"
+            @change="saveAutoLockFlag()"
           />
         </label>
       </div>

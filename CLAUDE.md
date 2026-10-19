@@ -83,7 +83,7 @@
 
 desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS / Windows），核心是**跨设备剪贴板同步**：
 
-- **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
+- **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。密码以机器绑定加密存储（配置文件不落明文）。
 - **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空（弹窗确认）/ 去重置顶，持久化到 `history.json`。
 - **内容识别与快捷操作**：历史条目自动识别内容类型（链接 / 邮箱 / 电话 / 颜色 / JSON / 路径 / Base64 / 算式 / Markdown，纯前端 `src/detect.ts`），显示类型徽标并按类型给出快捷操作：打开链接（默认浏览器）、写邮件 / 拨打（mailto / tel）、色块预览 + 复制 HEX/RGB、JSON 格式化预览 / 压缩复制、访达·资源管理器定位路径、Base64 解码预览、算式结果一键复制、Markdown 渲染预览（`src/markdown.ts` 白名单转义）。识别与操作全部本地完成、不联网，所有服务动作均为点击手动触发、不自动执行。
 - **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件（删除前弹窗确认），bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。支持拖拽文件到页面直接上传与「粘贴图片」（截图 / 复制图片后一键转 PNG 上传；也可 Ctrl+V）。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
@@ -116,6 +116,15 @@ cd src-tauri && cargo test
 cd src-tauri && cargo check
 ```
 
+```bash
+# 质量门禁（CI 会跑，提交前本地先过一遍）
+pnpm lint          # 前端 ESLint（eslint.config.js：vue essential + typescript-eslint）
+pnpm test:unit     # 前端纯逻辑单测
+cd src-tauri && cargo fmt --check
+cd src-tauri && cargo clippy --all-targets -- -D warnings
+cd src-tauri && cargo test
+```
+
 ## 项目结构
 
 ```
@@ -125,6 +134,7 @@ src/                          # Vue 3 前端
   styles.css                  # 全局设计变量（深浅色自适应）与通用组件样式（卡片/按钮/表单/开关/徽章/空状态）
   detect.ts                   # 剪贴板内容识别（纯函数）：链接/邮箱/电话/颜色/JSON/路径/Base64/算式/Markdown
   markdown.ts                 # Markdown 轻量渲染（预览用；先整体转义再生成白名单标签）
+  toast.ts                    # useToast 轻提示组合式（1.8s 自动消失，样式用全局 .toast）
   components/
     HistoryPage.vue           # 剪贴板历史（compact 属性 = 小窗口紧凑布局；类型徽标 + 快捷操作 + 预览弹层）
     FileHubPage.vue           # 文件中转站（MinIO 上传 / 下载 / 删除 + 拖拽 / 粘贴图片上传 + 传输进度，compact 属性 = 小窗口紧凑布局）
@@ -142,6 +152,7 @@ src-tauri/
     config.rs                 # MqttConfig / MinioConfig 持久化（config.json）与校验、MinIO 地址容错解析、bucket 名校验
     file_hub.rs               # 文件中转站：MinIO 上传 / 下载 / 删除 / 剪贴板图片转 PNG 上传（rust-s3，bucket 可配置，进度事件 filehub://progress）
     secret.rs                 # 本地凭据加密：机器绑定 HKDF-SHA256 + AES-256-GCM（enc:v1: 格式）
+    fs_atomic.rs              # 原子写盘：先写同目录临时文件再 rename（防止半截文件毁掉整份数据）
     mqtt.rs                   # MQTT 连接/订阅/收发、剪贴板监听发布（rumqttc + tokio）；收包只入队，后台单线程消费
     history.rs                # 剪贴板历史（200 条上限、去重置顶、history.json）
     logger.rs                 # 运行日志（内存 + JSONL 轮转，preview() 截断长文本）
@@ -180,4 +191,13 @@ src-tauri/
 - **锁屏同步**（`lock_sync.rs`）：topic `locksync/<group号>`，消息 `{"type":"lock"|"unlock","deviceId","ts"}`（QoS 1、不带 retain，瞬时事件不做离线补发）。本机检测为 1s 轮询：macOS dlopen CoreGraphics/CoreFoundation 调 `CGSessionCopyCurrentDictionary` 读 `CGSSessionScreenIsLocked`（键缺失/非 CFBoolean 按未锁）；Windows `OpenInputDesktop`（`ERROR_ACCESS_DENIED` = 已锁）。仅状态跃迁时发布，启动/开关开启只建立基准不补发；MQTT 未连接时状态变化不发布也不排队。远端 `lock` 复用 `auto_lock::lock_screen`（降级链路与日志完全一致，重复锁定事件会被「已锁定」检查跳过），远端 `unlock` 只唤醒屏幕（macOS `caffeinate -u -t 1`；Windows 广播 `SC_MONITORPOWER -1` + `ES_DISPLAY_REQUIRED`）——**不能也不应绕过密码**，这是功能边界不是缺陷。防回环：忽略自身 deviceId + 应用远端锁屏后 5s 抑制窗口（`REMOTE_SUPPRESS_MS`，一次性标记、状态不匹配即消费）；改检测/发布逻辑时先读 `LockSyncState` 的注释。开关 `lockSync` 默认关闭，关闭时不订阅、不发布、不处理；Windows FFI 只用 `cfg(windows)` 的 `windows-sys`（新增依赖注意 cross-check 方法见下）。
 - **Windows FFI 改动怎么验证**：`cargo check --target x86_64-pc-windows-msvc` 在本机（macOS）会卡在 `aws-lc-sys` 的 C 工具链（无 Windows clang/cc），验证不了应用代码；把改动的 FFI 代码摘到临时 crate（`windows-sys` 同版本）再 `cargo check --target x86_64-pc-windows-msvc` 可以拿到真实编译结果，最终仍以 CI（windows job）为准。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
+- **配置 / 历史一律原子写盘（`fs_atomic::write_text`）**：先写同目录 `.tmp.<进程id>.<序号>` 再 rename（同卷 rename 在 macOS / Windows / Linux 均为原子替换）。直接 `fs::write` 覆写目标文件，进程被杀 / 断电会留下半截文件，而 config / history 的读回策略都是「解析失败按默认值丢弃」——一次崩溃就静默重置全部配置（含 deviceId、凭据）或丢光历史。给新持久化数据落盘时用同一入口。
+- **凭据统一在 `MqttConfig::save / load` 这一层加密**：MinIO Access / Secret Key 与 MQTT password 都机器绑定加密（`enc:v1:` 前缀，`secret.rs`）；内存与前端接口始终明文。给新增的凭据字段套加密时也只在这一层做，同样**不要**动 serde 属性；无前缀的历史明文在 load 时原样透传（升级兼容）。
+- **单条同步文本上限 `mqtt::MAX_TEXT_BYTES`（512KB）**：本机发布、远端写入、history 入库三条路径统一拦截（raw 信封另有 4 倍的 `MAX_PAYLOAD_BYTES` 队列门禁）——超限内容不同步、不入史，避免撞 broker 报文上限（EMQX 默认 1MB）陷入「复制大段文本 → 无限重连」，history.json 也不会被单条记录撑大。调整时注意三处判定共用同一常量，别只改一处。
+- **设置页开关走窄接口**：离人自动锁屏 / 锁屏同步在设置页的开关和延迟输入用 `set_auto_lock` / `set_lock_sync` 命令（以持久化配置为基，只改目标字段后保存并重启同步）；它们绝不能走 `save_mqtt_config`（整份表单保存会把表单里未提交的 host / 密码一并写入并触发重连）。开启失败时（MQTT 未配置）后端返回引导文案，前端 catch 后 `loadConfig()` 回读，保证开关显示与持久化状态一致。
+- **前端 toast 用 `src/toast.ts` 的 `useToast()`** + `styles.css` 全局 `.toast`（页面组件里不要再复制 toast ref / 定时器 / 样式）；确认类操作仍走 `ConfirmDialog`，两个体系不在一处混用。
+- **App.vue 里事件监听先于首次状态拉取注册**（`listen` 再 `invoke`），避免两次调用之间到达的状态事件被漏掉——新增页面级状态时保持这个顺序。
+- **`tauri.conf.json` 已启用基线 CSP**（`default-src 'self'` + IPC connect + `style-src 'unsafe-inline'` 内联样式 + 无 object/base-uri 放行）。前端要加载新类型的远端资源（字体、图片、接口域名）时必须同步更新 csp 字段，否则 release 构建里资源会被静默拦截（dev 走 vite http 可能不触发）。
+- **文件中转站列举的防御上限**：`file_hub::list` 手动分页轮询（`list_page` 循环），最多 `MAX_LIST_PAGES`（20 页 × 1000 对象）即止并记 WARN；`minio_test_connection` 只做探活（复用 `ensure_bucket` 的 list_page(max-keys=1)），不再全量列举数文件。给列表加新信息（如递归）时保持上限思想。
+- **LogPage 事件刷新是 400ms 防抖**（`scheduleLoad`）：日志高频产生（重连风暴、复制），每条 `log://changed` 都整份 IPC 拷贝会拖卡页面；手动刷新按钮即时执行。事件负载若改为增量条目，需保持防抖函数与手动刷新两条路径的行为一致。
 

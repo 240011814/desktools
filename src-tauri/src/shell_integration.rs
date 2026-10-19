@@ -146,7 +146,7 @@ pub fn status() -> IntegrationStatus {
                 supported: true,
                 enabled: false,
                 detail,
-            }
+            };
         }
     };
     let installed: Vec<&'static str> = ENTRIES
@@ -417,8 +417,11 @@ pub fn install_workflow_to(dir: &Path, exe: &str, entry: &MenuEntry) -> Result<P
     std::fs::create_dir_all(&contents).map_err(|e| format!("无法创建快速操作目录：{e}"))?;
     std::fs::write(contents.join("Info.plist"), workflow_info(entry))
         .map_err(|e| format!("无法写入 Info.plist：{e}"))?;
-    std::fs::write(contents.join("document.wflow"), workflow_document(exe, entry))
-        .map_err(|e| format!("无法写入 document.wflow：{e}"))?;
+    std::fs::write(
+        contents.join("document.wflow"),
+        workflow_document(exe, entry),
+    )
+    .map_err(|e| format!("无法写入 document.wflow：{e}"))?;
     // 刷新系统服务缓存（失败不影响功能，系统会在下次登录时刷新）
     let _ = std::process::Command::new("pbs").arg("-update").output();
     Ok(bundle)
@@ -433,7 +436,7 @@ pub fn status() -> IntegrationStatus {
                 supported: true,
                 enabled: false,
                 detail,
-            }
+            };
         }
     };
     let installed: Vec<&'static str> = ENTRIES

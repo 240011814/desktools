@@ -7,6 +7,7 @@ mod autostart;
 mod clipboard;
 mod config;
 mod file_hub;
+mod fs_atomic;
 mod history;
 mod lock_sync;
 mod logger;
@@ -98,6 +99,94 @@ fn save_mqtt_config(app: tauri::AppHandle, mut cfg: MqttConfig) -> Result<MqttCo
     Ok(cfg)
 }
 
+/// 开关类设置（离人自动锁屏 / 锁屏同步）依赖 MQTT；未配置时给出可执行的引导
+fn require_mqtt_configured(cfg: &MqttConfig) -> Result<(), String> {
+    if cfg.host.trim().is_empty() || cfg.group.trim().is_empty() {
+        return Err("需要先配置 MQTT 连接（服务器地址与 Group 号，见「剪贴板同步」卡片）".into());
+    }
+    Ok(())
+}
+
+/// 开启开关：先确认 MQTT 已配置，再全量校验
+fn validate_switch_on(cfg: &MqttConfig) -> Result<(), String> {
+    require_mqtt_configured(cfg)?;
+    cfg.validate()
+}
+
+/// 关闭开关：从未配置过同步的机器也应能关掉开关（仅保存状态，不做 MQTT 相关校验）
+fn validate_switch_off(cfg: &MqttConfig) -> Result<(), String> {
+    if cfg.host.trim().is_empty() {
+        return Ok(());
+    }
+    cfg.validate()
+}
+
+/// 更新单个开关类配置：以持久化配置为基，只改目标字段后保存，再重启同步。
+///
+/// 与 `save_mqtt_config`（整份表单保存）相对：设置页的开关调用本路径，
+/// 避免把表单里「已修改但未提交」的其他字段（host / 密码等）一并写入并重连。
+fn apply_switch_update(
+    app: &tauri::AppHandle,
+    update: impl FnOnce(&mut MqttConfig),
+    validate: fn(&MqttConfig) -> Result<(), String>,
+) -> Result<MqttConfig, String> {
+    let cfg = {
+        let state = app.state::<SyncState>();
+        let mut cfg = state.config.lock().unwrap().clone();
+        update(&mut cfg);
+        cfg
+    };
+    validate(&cfg)?;
+
+    cfg.save(&config::config_path(app))?;
+    {
+        let state = app.state::<SyncState>();
+        *state.config.lock().unwrap() = cfg.clone();
+    }
+    // 关闭离人自动锁屏时，取消挂起中的延迟锁屏
+    if !cfg.auto_lock {
+        app.state::<auto_lock::AutoLockState>().cancel_all(app);
+    }
+    // 重启同步：开启时建立 csi/notify 与 locksync 订阅；关闭时旧订阅随重连断开
+    mqtt::start(app.clone(), cfg.clone());
+    Ok(cfg)
+}
+
+/// 切换「离人自动锁屏」开关（窄接口：只改开关与延迟，不保存设置页其他未提交字段）
+#[tauri::command]
+fn set_auto_lock(
+    app: tauri::AppHandle,
+    enabled: bool,
+    delay_secs: u64,
+) -> Result<MqttConfig, String> {
+    apply_switch_update(
+        &app,
+        |cfg| {
+            cfg.auto_lock = enabled;
+            cfg.auto_lock_delay_secs = delay_secs.clamp(1, 300);
+        },
+        if enabled {
+            validate_switch_on
+        } else {
+            validate_switch_off
+        },
+    )
+}
+
+/// 切换「锁屏同步」开关（窄接口，同上）
+#[tauri::command]
+fn set_lock_sync(app: tauri::AppHandle, enabled: bool) -> Result<MqttConfig, String> {
+    apply_switch_update(
+        &app,
+        |cfg| cfg.lock_sync = enabled,
+        if enabled {
+            validate_switch_on
+        } else {
+            validate_switch_off
+        },
+    )
+}
+
 #[tauri::command]
 fn get_history(state: State<HistoryState>) -> Vec<HistoryItem> {
     state.list()
@@ -169,7 +258,10 @@ fn get_autostart_state(app: tauri::AppHandle) -> Result<autostart::AutostartStat
 }
 
 #[tauri::command]
-fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<autostart::AutostartState, String> {
+fn set_autostart(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<autostart::AutostartState, String> {
     autostart::set_enabled(&app, enabled)
 }
 
@@ -181,7 +273,12 @@ fn get_lock_capability() -> auto_lock::LockReport {
 
 /// 从当前内存配置中取 MinIO 配置
 fn current_minio(app: &tauri::AppHandle) -> MinioConfig {
-    app.state::<SyncState>().config.lock().unwrap().minio.clone()
+    app.state::<SyncState>()
+        .config
+        .lock()
+        .unwrap()
+        .minio
+        .clone()
 }
 
 /// 保存 MinIO 配置（host 留空 = 清除配置；凭据写盘时机器绑定加密）
@@ -237,12 +334,19 @@ async fn minio_test_connection(
             logger::log(
                 &app,
                 logger::INFO,
-                format!("文件中转站：{message}（{} ms）", started.elapsed().as_millis()),
+                format!(
+                    "文件中转站：{message}（{} ms）",
+                    started.elapsed().as_millis()
+                ),
             );
             Ok(message)
         }
         Err(err) => {
-            logger::log(&app, logger::WARN, format!("文件中转站：测试连接失败：{err}"));
+            logger::log(
+                &app,
+                logger::WARN,
+                format!("文件中转站：测试连接失败：{err}"),
+            );
             Err(err)
         }
     }
@@ -411,6 +515,8 @@ pub fn run() {
             get_mqtt_config,
             get_mqtt_status,
             save_mqtt_config,
+            set_auto_lock,
+            set_lock_sync,
             get_history,
             delete_history,
             clear_history,
@@ -433,8 +539,7 @@ pub fn run() {
         ])
         .setup(|app| {
             // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）
-            let history_item =
-                MenuItem::with_id(app, "history", "剪贴板历史", true, None::<&str>)?;
+            let history_item = MenuItem::with_id(app, "history", "剪贴板历史", true, None::<&str>)?;
             let files_item = MenuItem::with_id(app, "files", "文件中转站", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;

@@ -23,8 +23,7 @@ fn with_clipboard<R>(
     op: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
 ) -> Result<R, String> {
     if CLIPBOARD.get().is_none() {
-        let clipboard =
-            arboard::Clipboard::new().map_err(|e| format!("初始化剪贴板失败：{e}"))?;
+        let clipboard = arboard::Clipboard::new().map_err(|e| format!("初始化剪贴板失败：{e}"))?;
         let _ = CLIPBOARD.set(Mutex::new(clipboard));
     }
     let mutex = CLIPBOARD
@@ -148,14 +147,7 @@ mod tests {
 
     #[test]
     fn succeeds_on_first_attempt() {
-        let attempts = write_with_retry(
-            "hello",
-            || Ok(()),
-            || Ok("hello".into()),
-            3,
-            0,
-        )
-        .unwrap();
+        let attempts = write_with_retry("hello", || Ok(()), || Ok("hello".into()), 3, 0).unwrap();
         assert_eq!(attempts, 1);
     }
 

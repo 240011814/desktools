@@ -248,7 +248,7 @@ function detectJson(t: string): { pretty: string; min: string } | null {
 /* ---------- 文件 / 文件夹路径 ---------- */
 
 function detectPath(t: string): string | null {
-  let s = t.trim().replace(/^["'「『]|["'」』]$/g, "");
+  const s = t.trim().replace(/^["'「『]|["'」』]$/g, "");
   if (s.length < 2 || s.length > 1024) return null;
   // 句末标点 / 全角标点大概率是普通文本而非路径
   if (/[，。；：！？]/.test(s)) return null;

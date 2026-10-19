@@ -137,7 +137,10 @@ impl LockSyncState {
                 logger::log(
                     app,
                     WARN,
-                    format!("锁屏同步：忽略无法识别的消息（{err}）：{}", logger::preview(raw)),
+                    format!(
+                        "锁屏同步：忽略无法识别的消息（{err}）：{}",
+                        logger::preview(raw)
+                    ),
                 );
                 return;
             }
@@ -152,7 +155,9 @@ impl LockSyncState {
                 }
                 logger::log(app, INFO, "锁屏同步：收到远端锁屏事件，正在锁定本机");
                 match auto_lock::lock_screen(app) {
-                    Ok(method) => logger::log(app, INFO, format!("锁屏同步：已锁定屏幕（{method}）")),
+                    Ok(method) => {
+                        logger::log(app, INFO, format!("锁屏同步：已锁定屏幕（{method}）"))
+                    }
                     Err(err) => logger::log(app, ERROR, format!("锁屏同步：锁屏失败：{err}")),
                 }
             }
@@ -160,7 +165,9 @@ impl LockSyncState {
                 // 唤醒屏幕不会改变锁屏状态（仍停在锁屏界面），无需抑制发布
                 logger::log(app, INFO, "锁屏同步：收到远端解锁事件，正在唤醒屏幕");
                 match wake_display() {
-                    Ok(detail) => logger::log(app, INFO, format!("锁屏同步：已唤醒屏幕（{detail}）")),
+                    Ok(detail) => {
+                        logger::log(app, INFO, format!("锁屏同步：已唤醒屏幕（{detail}）"))
+                    }
                     Err(err) => logger::log(app, WARN, format!("锁屏同步：唤醒屏幕失败：{err}")),
                 }
             }
@@ -237,8 +244,10 @@ fn macos_is_screen_locked() -> Result<bool, String> {
         .ok_or("dlopen CoreGraphics 失败")?,
     );
     let cf = Framework(
-        auto_lock::open_framework("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-            .ok_or("dlopen CoreFoundation 失败")?,
+        auto_lock::open_framework(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        )
+        .ok_or("dlopen CoreFoundation 失败")?,
     );
 
     unsafe {
@@ -254,16 +263,19 @@ fn macos_is_screen_locked() -> Result<bool, String> {
             auto_lock::dlsym_checked(cf.0, "CFDictionaryGetValue")
                 .ok_or("缺少 CFDictionaryGetValue")?,
         );
-        let get_type_id: GetTypeId =
-            std::mem::transmute(auto_lock::dlsym_checked(cf.0, "CFGetTypeID").ok_or("缺少 CFGetTypeID")?);
+        let get_type_id: GetTypeId = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFGetTypeID").ok_or("缺少 CFGetTypeID")?,
+        );
         let bool_type_id: GetTypeIdNoArg = std::mem::transmute(
-            auto_lock::dlsym_checked(cf.0, "CFBooleanGetTypeID").ok_or("缺少 CFBooleanGetTypeID")?,
+            auto_lock::dlsym_checked(cf.0, "CFBooleanGetTypeID")
+                .ok_or("缺少 CFBooleanGetTypeID")?,
         );
         let bool_get: BoolGetValue = std::mem::transmute(
             auto_lock::dlsym_checked(cf.0, "CFBooleanGetValue").ok_or("缺少 CFBooleanGetValue")?,
         );
-        let release: Release =
-            std::mem::transmute(auto_lock::dlsym_checked(cf.0, "CFRelease").ok_or("缺少 CFRelease")?);
+        let release: Release = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFRelease").ok_or("缺少 CFRelease")?,
+        );
 
         let dict = session_dict();
         if dict.is_null() {
@@ -275,7 +287,8 @@ fn macos_is_screen_locked() -> Result<bool, String> {
             return Err("构造 CGSSessionScreenIsLocked 键失败".into());
         }
         let value = dict_get(dict, key);
-        let locked = !value.is_null() && get_type_id(value) == bool_type_id() && bool_get(value) != 0;
+        let locked =
+            !value.is_null() && get_type_id(value) == bool_type_id() && bool_get(value) != 0;
         release(key);
         release(dict);
         Ok(locked)
@@ -316,7 +329,8 @@ fn windows_wake_display() -> Result<String, String> {
     };
 
     // WM_SYSCOMMAND 只取 wParam 低 16 位：SC_MONITORPOWER + lParam(-1) = 打开显示器
-    let posted = unsafe { PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER as usize, -1) };
+    let posted =
+        unsafe { PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER as usize, -1) };
     let previous = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED) };
     unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
     if posted != 0 || previous != 0 {
@@ -389,7 +403,11 @@ pub fn spawn_watcher(app: AppHandle) {
                     Err(err) => {
                         // 检测失败：仅在原因变化时记 WARN，避免每秒刷日志
                         if last_error.as_deref() != Some(err.as_str()) {
-                            logger::log(&app, WARN, format!("锁屏同步：检测本机锁屏状态失败：{err}"));
+                            logger::log(
+                                &app,
+                                WARN,
+                                format!("锁屏同步：检测本机锁屏状态失败：{err}"),
+                            );
                             last_error = Some(err);
                         }
                         continue;
@@ -402,7 +420,11 @@ pub fn spawn_watcher(app: AppHandle) {
                     Some(_) => {
                         baseline = Some(locked);
                         if app.state::<LockSyncState>().should_suppress(locked) {
-                            logger::log(&app, INFO, "锁屏同步：本机状态变化由远端事件触发，跳过发布");
+                            logger::log(
+                                &app,
+                                INFO,
+                                "锁屏同步：本机状态变化由远端事件触发，跳过发布",
+                            );
                         } else if let Some(client) = &client {
                             publish_state(&app, client, locked);
                         } else {
@@ -441,7 +463,10 @@ mod tests {
     #[test]
     fn parses_remote_lock_and_unlock() {
         let lock = r#"{"type":"lock","deviceId":"other","ts":1}"#;
-        assert_eq!(parse_remote_message(lock, "me").unwrap(), Some(LockEvent::Lock));
+        assert_eq!(
+            parse_remote_message(lock, "me").unwrap(),
+            Some(LockEvent::Lock)
+        );
         let unlock = r#"{"type":"unlock","deviceId":"other","ts":2}"#;
         assert_eq!(
             parse_remote_message(unlock, "me").unwrap(),

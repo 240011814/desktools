@@ -7,6 +7,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { detectContent, type ContentInfo } from "../detect";
 import { renderMarkdown } from "../markdown";
 import type { HistoryItem } from "../store";
+import { useToast } from "../toast";
 import ConfirmDialog from "./ConfirmDialog.vue";
 
 /** compact：独立历史小窗口布局（桌面右键 / 托盘弹出） */
@@ -15,16 +16,28 @@ defineProps<{ compact?: boolean }>();
 const HISTORY_LIMIT = 200;
 
 const items = ref<HistoryItem[]>([]);
-const toast = ref("");
+const { toast, showToast } = useToast();
 const confirmClearOpen = ref(false);
 const clearing = ref(false);
-let toastTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
 let unlistenRefresh: UnlistenFn | undefined;
 
+/** 识别结果缓存：列表刷新频繁但内容重复率高，避免每次重跑 JSON.parse / Base64 解码 */
+const detectCache = new Map<string, ContentInfo>();
+const DETECT_CACHE_MAX = 400;
+
+function detectCached(text: string): ContentInfo {
+  const hit = detectCache.get(text);
+  if (hit) return hit;
+  const info = detectContent(text);
+  if (detectCache.size >= DETECT_CACHE_MAX) detectCache.clear();
+  detectCache.set(text, info);
+  return info;
+}
+
 /** 条目 + 内容识别结果（纯本地识别，渲染时计算） */
 const decorated = computed(() =>
-  items.value.map((item) => ({ item, info: detectContent(item.text) })),
+  items.value.map((item) => ({ item, info: detectCached(item.text) })),
 );
 
 /** 预览弹层（JSON 格式化 / Base64 解码 / Markdown 渲染） */
@@ -55,12 +68,6 @@ async function load() {
   } catch {
     items.value = [];
   }
-}
-
-function showToast(text: string) {
-  toast.value = text;
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (toast.value = ""), 1800);
 }
 
 async function copyItem(item: HistoryItem) {
@@ -240,7 +247,6 @@ onUnmounted(() => {
   window.removeEventListener("keydown", onKeydown);
   unlisten?.();
   unlistenRefresh?.();
-  clearTimeout(toastTimer);
 });
 </script>
 
@@ -714,30 +720,5 @@ button.mini {
 .md-body :deep(td) {
   border: 1px solid var(--border);
   padding: 3px 9px;
-}
-
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 34px;
-  transform: translateX(-50%);
-  padding: 8px 18px;
-  border-radius: 999px;
-  background: var(--text);
-  color: var(--bg-elevated);
-  font-size: 0.82rem;
-  box-shadow: var(--shadow);
-  animation: fade-in 0.18s ease-out;
-}
-
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translate(-50%, 6px);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, 0);
-  }
 }
 </style>

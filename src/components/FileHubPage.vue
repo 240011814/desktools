@@ -6,6 +6,7 @@ import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import ConfirmDialog from "./ConfirmDialog.vue";
+import { useToast } from "../toast";
 import type { MqttConfig } from "../store";
 
 /** compact：独立文件中转站小窗口布局（桌面右键 / 托盘弹出） */
@@ -51,8 +52,7 @@ const transfers = ref<Record<string, Transfer>>({});
 /** 待确认删除的文件（非空时显示确认弹窗） */
 const pendingDelete = ref<HubFile | null>(null);
 const deleting = ref(false);
-const toast = ref("");
-let toastTimer: number | undefined;
+const { toast, showToast } = useToast();
 let savedTimer: number | undefined;
 let initialized = false;
 let unlisten: UnlistenFn | undefined;
@@ -112,21 +112,32 @@ async function upload() {
   await uploadPaths(Array.isArray(picked) ? picked : [picked]);
 }
 
-/** 逐个上传本地文件（文件选择器与拖拽共用的入口） */
+/** 最多同时进行的上传数：几十个文件排队串行全量过慢，3 路已能打满常见带宽 */
+const MAX_CONCURRENT_UPLOADS = 3;
+
+/** 并发分批上传本地文件（文件选择器与拖拽共用的入口） */
 async function uploadPaths(paths: string[]) {
   if (uploading.value || !paths.length) return;
   uploading.value = true;
   error.value = "";
   const failures: string[] = [];
-  for (const path of paths) {
-    const transferId = `up-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      await invoke("file_hub_upload", { path, transferId });
-    } catch (e) {
-      delete transfers.value[transferId];
-      failures.push(`${baseName(path)}：${String(e)}`);
+  const queue = [...paths];
+  const worker = async () => {
+    while (queue.length) {
+      const path = queue.shift();
+      if (!path) break;
+      const transferId = `up-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      try {
+        await invoke("file_hub_upload", { path, transferId });
+      } catch (e) {
+        delete transfers.value[transferId];
+        failures.push(`${baseName(path)}：${String(e)}`);
+      }
     }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(MAX_CONCURRENT_UPLOADS, paths.length) }, () => worker()),
+  );
   uploading.value = false;
   if (failures.length) {
     error.value = `上传失败 — ${failures.join("；")}`;
@@ -244,12 +255,6 @@ async function confirmDelete() {
   }
 }
 
-function showToast(text: string) {
-  toast.value = text;
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (toast.value = ""), 1800);
-}
-
 function onProgress(payload: ProgressPayload) {
   if (payload.phase !== "progress") {
     // 完成 / 失败都会结束进度行（失败详情由命令返回值在错误条里展示）
@@ -335,7 +340,6 @@ onActivated(() => {
 });
 
 onUnmounted(() => {
-  window.clearTimeout(toastTimer);
   window.clearTimeout(savedTimer);
   window.removeEventListener("focus", onWindowFocus);
   window.removeEventListener("paste", onPaste);
@@ -668,30 +672,5 @@ button.link:hover {
   margin-bottom: 0;
 }
 
-/* 操作结果提示（删除成功等） */
-.toast {
-  position: fixed;
-  left: 50%;
-  bottom: 34px;
-  transform: translateX(-50%);
-  z-index: 70;
-  padding: 8px 18px;
-  border-radius: 999px;
-  background: var(--text);
-  color: var(--bg-elevated);
-  font-size: 0.82rem;
-  box-shadow: var(--shadow);
-  animation: fade-in 0.18s ease-out;
-}
-
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translate(-50%, 6px);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, 0);
-  }
-}
+/* 操作结果提示（删除成功等）由全局 .toast（styles.css）渲染，此处不再重复定义 */
 </style>
