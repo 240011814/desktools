@@ -41,7 +41,11 @@ if ! codesign -vv --deep "$APP"; then
     fi
     rm -f "$ARCHIVE" "$ARCHIVE.sig"
     tar -czf "$ARCHIVE" -C "$BUNDLE_MACOS_DIR" "$APP_NAME.app"
-    pnpm tauri signer sign "$ARCHIVE"
+    # updater 配置了 requireSignedVersion：签名必须携带被发布版本号。
+    # `tauri build` 的自动签名会自动填版本号，手动签名必须显式传 --app-version，
+    # 且要与构建实际使用的版本一致（CI 会把版本写进 tauri.conf.json 再构建）
+    APP_VERSION=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)")
+    pnpm tauri signer sign "$ARCHIVE" --app-version "$APP_VERSION"
   fi
 
   # DMG 同样要包含重签后的 .app

@@ -3,7 +3,13 @@
 //! - 收发分离：`lockSyncPublish`（广播我的锁屏 / 解锁状态）与 `lockSyncFollow`（跟随他人）
 //!   是两个独立开关——工作机等「正在被使用的设备」可以只广播、不跟随，或者都不启用。
 //! - 本机状态：轮询检测（约 1 秒；macOS `CGSessionCopyCurrentDictionary`，Windows `OpenInputDesktop`），
-//!   仅在「未锁 → 已锁」/「已锁 → 未锁」跃迁时发布；启动 / 开关刚开启时以当前状态为基准，不补发旧事件。
+//!   仅在「未锁 → 已锁」/「已锁 → 未锁」跃迁时处理；启动 / 开关刚开启时以当前状态为基准，不补发旧事件。
+//! - 真锁屏判定（广播端）：仅「锁定瞬间显示器仍点亮」的立即型锁定（SAC / Ctrl+Cmd+Q，
+//!   立即要求密码）广播 lock；与显示器熄灭同刻的息屏型锁定（阶段一，密码延迟未到期）
+//!   不广播，不让本机空闲息屏带动远端设备真锁屏；显示器状态探测失败 fail-open，
+//!   按真锁屏广播（宁多广播、勿漏真锁）。
+//! - 配套对称：只有此前广播过 lock 的锁定会话，其后的「已锁 → 未锁」才广播 unlock；
+//!   息屏型阶段的免密恢复不广播，避免无来源的解锁事件把远端屏幕点亮。
 //! - 远端事件：`lock` → 复用 `auto_lock` 的锁屏链路锁定本机，但受**活跃守卫**约束
 //!   （本机最近 `lockSyncIdleGuardSecs` 秒内有人键鼠输入则跳过；0 = 关闭守卫；探测失败
 //!   fail-open：照常锁屏并记 WARN）；`unlock` → 仅唤醒显示器到锁屏界面（远程无法、
@@ -492,9 +498,79 @@ fn publish_state(app: &AppHandle, client: &rumqttc::AsyncClient, locked: bool) {
     );
 }
 
-/// 监听本机锁屏状态（轮询），状态跃迁时发布到 locksync/<group>：
+/* ---------------- 真锁屏判定（广播端） ---------------- */
+
+/// 本机显示器是否处于点亮状态（区分「显示器亮着的立即型真锁屏」与「显示器同步熄灭的
+/// 息屏型阶段一锁定」）：
+/// - macOS：`CGDisplayIsActive(kCGNullDirectDisplay)`（与 is_screen_locked 相同的
+///   dlopen 模式，只读查询、无需任何权限）
+/// - Windows：锁定语义本就是真锁屏（`LockWorkStation`），显示器状态无关，恒报点亮
+pub fn display_is_active() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_display_is_active()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(true)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台不支持显示器状态检测".into())
+    }
+}
+
+/// macOS：`CGDisplayIsActive(0)`，0 = kCGNullDirectDisplay，任一显示器亮即点亮。
+/// 与 macos_idle_secs / macos_is_screen_locked 相同的 dlopen/dlsym 模式
+#[cfg(target_os = "macos")]
+fn macos_display_is_active() -> Result<bool, String> {
+    use std::ffi::c_void;
+
+    /// CGDisplayIsActive 返回 CoreGraphics 的 boolean_t（mach 下为 int）
+    type IsActive = unsafe extern "C" fn(u32) -> i32;
+
+    /// dlopen 的框架句柄，Drop 时 dlclose（与同文件其他探测相同的模式，不泄漏引用计数）
+    struct Framework(*mut c_void);
+    impl Drop for Framework {
+        fn drop(&mut self) {
+            unsafe { libc::dlclose(self.0) };
+        }
+    }
+
+    let cg = Framework(
+        auto_lock::open_framework(
+            "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/CoreGraphics.framework/CoreGraphics",
+        )
+        .ok_or("dlopen CoreGraphics 失败")?,
+    );
+
+    let is_active: IsActive = unsafe {
+        std::mem::transmute(
+            auto_lock::dlsym_checked(cg.0, "CGDisplayIsActive").ok_or("缺少 CGDisplayIsActive")?,
+        )
+    };
+
+    let active = unsafe { is_active(0) };
+    Ok(active != 0)
+}
+
+/// 判定一次「未锁 → 已锁」跃迁是否属于真锁屏（纯逻辑，供测试）：
+/// - `Ok(true)`：显示器还亮着的立即型锁定（SAC / Ctrl+Cmd+Q / 立即要求密码）→ 广播
+/// - `Ok(false)`：显示器同步熄灭的息屏型锁定（阶段一，密码延迟未到期）→ 不广播
+/// - `Err`：探测失败 fail-open，按真锁屏广播（宁多广播、勿漏真锁）
+pub fn is_active_display_lock(display_active: &Result<bool, String>) -> bool {
+    match display_active {
+        Ok(active) => *active,
+        Err(_) => true,
+    }
+}
+
+/// 监听本机锁屏状态（轮询），状态跃迁时按真锁屏判定发布到 locksync/<group>：
 /// - 启动 / 开关刚开启：先建立基准状态，不发布
 /// - 应用远端事件引起的被动变化：由抑制窗口拦截，不发布
+/// - 仅「锁定瞬间显示器仍点亮」的立即型真锁屏发布 lock，息屏型锁定不发布；
+///   显示器状态探测失败 fail-open 视为真锁屏发布
+/// - 只有此前广播过 lock 的会话随后才广播 unlock（息屏型阶段免密恢复不广播）
 /// - MQTT 未连接：不发布（事件即时性内容不做补发，重连后也不回放旧状态）
 #[cfg(desktop)]
 pub fn spawn_watcher(app: AppHandle) {
@@ -503,6 +579,8 @@ pub fn spawn_watcher(app: AppHandle) {
         .spawn(move || {
             let mut baseline: Option<bool> = None;
             let mut last_error: Option<String> = None;
+            // 本次锁定会话是否对外广播过 lock：决定其 unlock 是否跟随广播
+            let mut announced = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
 
@@ -514,6 +592,7 @@ pub fn spawn_watcher(app: AppHandle) {
                 if !publish || group.trim().is_empty() {
                     // 「广播」关闭 / 未配置：清除基准，下次开启时重新建立，不补发历史状态
                     baseline = None;
+                    announced = false;
                     continue;
                 }
 
@@ -541,15 +620,49 @@ pub fn spawn_watcher(app: AppHandle) {
                     Some(prev) if prev == locked => {}
                     Some(_) => {
                         baseline = Some(locked);
-                        if app.state::<LockSyncState>().should_suppress(locked) {
-                            logger::log(
-                                &app,
-                                INFO,
-                                "锁屏同步：本机状态变化由远端事件触发，跳过发布",
-                            );
+                        // 无论锁定/解锁跃迁都消费抑制标记（保持一次性语义，
+                        // 防止远端锁屏窗口内被快速解锁后标记滞留在下一次跃迁）
+                        let suppressed = app.state::<LockSyncState>().should_suppress(locked);
+                        if locked {
+                            if suppressed {
+                                announced = false;
+                                logger::log(
+                                    &app,
+                                    INFO,
+                                    "锁屏同步：本机状态变化由远端事件触发，跳过发布",
+                                );
+                            } else if !is_active_display_lock(&display_is_active()) {
+                                // 锁定与显示器熄灭同刻：息屏型阶段一（密码延迟未到期），不广播
+                                announced = false;
+                                logger::log(
+                                    &app,
+                                    INFO,
+                                    "锁屏同步：息屏型锁定（显示器同步熄灭），不广播",
+                                );
+                            } else if let Some(client) = &client {
+                                announced = true;
+                                publish_state(&app, client, locked);
+                            } else {
+                                announced = false;
+                                logger::log(
+                                    &app,
+                                    INFO,
+                                    "锁屏同步：MQTT 未连接，本次状态变化未发布",
+                                );
+                            }
                         } else if let Some(client) = &client {
-                            publish_state(&app, client, locked);
+                            if announced {
+                                announced = false;
+                                publish_state(&app, client, locked);
+                            } else {
+                                logger::log(
+                                    &app,
+                                    INFO,
+                                    "锁屏同步：本机解锁（此前未广播锁定），跳过发布",
+                                );
+                            }
                         } else {
+                            announced = false;
                             logger::log(&app, INFO, "锁屏同步：MQTT 未连接，本次状态变化未发布");
                         }
                     }
@@ -679,5 +792,24 @@ mod tests {
     #[test]
     fn real_detection_does_not_panic() {
         let _ = is_screen_locked();
+    }
+
+    #[test]
+    fn classifies_real_lock_by_display_state() {
+        // SAC / Ctrl+Cmd+Q / 立即密码：锁定瞬间显示器还亮 → 真锁屏，广播
+        let on: Result<bool, String> = Ok(true);
+        assert!(is_active_display_lock(&on));
+        // 息屏型（阶段一）：锁定与显示器熄灭同刻 → 不广播
+        let off: Result<bool, String> = Ok(false);
+        assert!(!is_active_display_lock(&off));
+        // 探测失败 fail-open：按真锁屏广播
+        let broken: Result<bool, String> = Err("dlopen CoreGraphics 失败".into());
+        assert!(is_active_display_lock(&broken));
+    }
+
+    /// 真实探测一次本机显示器状态：保证 CGDisplayIsActive 的 dlopen/dlsym 链路不 panic
+    #[test]
+    fn real_display_probe_does_not_panic() {
+        let _ = display_is_active();
     }
 }
