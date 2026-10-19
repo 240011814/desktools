@@ -84,9 +84,9 @@
 desktools 是基于 **Tauri 2 + Vue 3 + TypeScript** 的桌面工具箱（macOS / Windows），核心是**跨设备剪贴板同步**：
 
 - **MQTT 剪贴板同步**：配置 MQTT 连接（host / port / 用户名 / 密码 / TLS）与 Group 号后，启动即自动连接并订阅 `texthub/<group号>`；本机复制的文本连同本机 `deviceId` 发布到该 topic，收到其他设备的内容自动写入剪贴板（忽略自身消息防回环）。
-- **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空 / 去重置顶，持久化到 `history.json`。
+- **剪贴板历史**：最近 200 条复制记录（含远端同步、标记来源），支持点击复制 / 单条删除 / 一键清空（弹窗确认）/ 去重置顶，持久化到 `history.json`。
 - **内容识别与快捷操作**：历史条目自动识别内容类型（链接 / 邮箱 / 电话 / 颜色 / JSON / 路径 / Base64 / 算式 / Markdown，纯前端 `src/detect.ts`），显示类型徽标并按类型给出快捷操作：打开链接（默认浏览器）、写邮件 / 拨打（mailto / tel）、色块预览 + 复制 HEX/RGB、JSON 格式化预览 / 压缩复制、访达·资源管理器定位路径、Base64 解码预览、算式结果一键复制、Markdown 渲染预览（`src/markdown.ts` 白名单转义）。识别与操作全部本地完成、不联网，所有服务动作均为点击手动触发、不自动执行。
-- **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件，bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。支持拖拽文件到页面直接上传与「粘贴图片」（截图 / 复制图片后一键转 PNG 上传；也可 Ctrl+V）。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
+- **文件中转站**：通过 MinIO（S3 兼容）在多台设备间上传 / 下载 / 删除文件（删除前弹窗确认），bucket 可配置（默认 `hub`，不存在时自动创建，名称为 3~63 位小写字母、数字、中划线或点）；服务器地址、端口、存储桶、Access Key / Secret Key 在「系统设置 → 文件中转站」配置，凭据机器绑定加密后存本机（`enc:v1:` 密文，换机器需重填）。大文件自动分片、流式传输并显示进度，下载失败自动清理半成品文件。支持拖拽文件到页面直接上传与「粘贴图片」（截图 / 复制图片后一键转 PNG 上传；也可 Ctrl+V）。桌面右键 / 托盘菜单可弹出独立的文件中转站小窗口。
 - **运行日志**：MQTT 连接与收发消息内容、历史读写、剪贴板操作等关键事件（INFO/WARN/ERROR），持久化 JSONL 文件（内存 1000 条、文件 1MB 轮转），日志页支持级别筛选。
 - **离人自动锁屏**（可选开关，`config.json` 的 `autoLock`）：开启后在现有 MQTT 连接上额外订阅 `csi/notify`（QoS 1，wol_rs/ESP32 的人体感知通知），收到 `event=leave` 开始倒计时（`autoLockDelaySecs`，默认 15s），**期间收到 `approach` 自动取消，倒计时结束才真正锁屏**；两次锁屏至少间隔 60s。锁屏链路逐级降级并记录原因：macOS `SACLockScreenImmediate`（LoginUIKit 私有接口，真锁屏无需权限）→ Ctrl+Cmd+Q（需辅助功能）→ `pmset displaysleepnow`（等效锁屏需「唤醒时需要密码」）；Windows `LockWorkStation`。**启动时做锁屏能力自检**（SAC 可用性 / 辅助功能 / 自动化 / 唤醒密码），结果记日志并在设置页展示。
 - **系统集成**：桌面右键菜单弹出历史 / 文件中转站小窗口（Windows 注册表静态菜单项；macOS Finder「快速操作」workflow，两条目统一开关管理）；托盘右键菜单含「剪贴板历史 / 文件中转站 / 显示主窗口 / 退出」。
@@ -130,6 +130,7 @@ src/                          # Vue 3 前端
     LogPage.vue               # 运行日志（级别筛选 / 刷新 / 清空）
     UpdatePage.vue            # 软件更新检测与安装
     SettingsPage.vue          # 系统设置：MQTT 同步配置 + 文件中转站（MinIO）+ 桌面右键集成 + 开机自启
+    ConfirmDialog.vue         # 通用确认弹窗（删除 / 清空等不可逆操作；替代原两段式点击确认）
 src-tauri/
   src/
     lib.rs                    # 入口：托盘菜单、窗口管理、命令注册、单实例、启动参数（--history / --files / --hidden）
@@ -173,5 +174,6 @@ src-tauri/
 - **Tauri v2 的 ACL 只拦 `plugin:` 命令**：`tauri` 源码（`src/webview/mod.rs`）里只有当请求是插件命令（含 `core:*`，如 `core:event|listen`）或应用自带 ACL manifest 或来自远程 origin 时才校验 capability；自定义命令（`generate_handler!` 注册的）默认不受 ACL 限制。窗口 label 不在任何 capability 的 `windows` 列表时，它的 `listen` / dialog / opener 等插件命令全部被拒（release 报 "Command plugin:xxx not allowed by ACL"，debug 有更详细的 `resolve_access_message`）。历史小窗口曾因为没进 `windows` 列表静默收不到 `history://refresh`（listen 失败被 try/catch 吞了，表象是「右键打开不是最新数据」）；修复后仍保留前端 `window` focus 兜底刷新（HistoryPage / FileHubPage compact）双保险。新增窗口（如 files）后必须把 label 加进 `capabilities/default.json`（core/opener）和所需插件权限文件（dialog 等）。
 - **拖拽上传与剪贴板图片上传**（FileHubPage / file_hub.rs）：窗口 `dragDropEnabled` 默认 `true`（原生接管文件拖放，会禁用 webview 的 HTML5 dnd），前端用 `getCurrentWindow().onDragDropEvent`（底层是 `core:event|listen`，窗口需在 capability `windows` 列表里）拿 `enter/over/drop/leave` + 文件路径。剪贴板图片在 Rust 侧用 `clipboard::read_image()` 读取（自持 arboard 实例，arboard 需启用 `image-data` feature），RGBA 数据在 `spawn_blocking` 里用 `png` crate 编码为 PNG 再走 `put_object_stream_with_content_type` 上传（图片小、不发进度事件）；前端 Ctrl+V 只在剪贴板没有文本时接管，避免拦截正常粘贴。
 - **剪贴板内容识别与快捷操作**（`src/detect.ts` / `src/markdown.ts` / HistoryPage.vue）：识别是前端纯函数（`scripts/detect.test.ts` 用 Node 内置 test runner 覆盖，`pnpm test:unit`），失败一律归「纯文本」不显示徽标。快捷操作全部点击触发：链接 / 邮箱 / 电话走 opener 插件的 `openUrl`（`opener:default` 默认放行 http / https / mailto / tel），路径走 `revealItemInDir`（`~` 用 `homeDir()` 展开）；JSON / Base64 / Markdown 在页面内预览弹层展示（Markdown 渲染先整体转义再生成白名单标签，链接只生成 data-url 由点击拦截走 openUrl，避免注入和 webview 内导航）。算式用自写递归下降解析器（不用 eval / new Function），只接受数字与 `+ - * / % ^ ( )`；识别顺序单行是 链接→邮箱→电话→颜色→JSON→路径→Base64→算式→Markdown，多行是 JSON→Markdown→Base64，改动时注意别让 `#fff`（颜色）撞 Markdown 标题、日期（2023-01-01）撞电话 / 算式这类误判。
+- **不可逆操作确认统一走 `ConfirmDialog`**（文件中转站删除文件 / 历史一键清空 / 日志清空）：overlay + 取消按钮 / 点遮罩 / Esc 关闭，确认按钮 busy 态（「删除中…」）防重复点击、busy 期间不可关闭；旧的「点击变确认按钮」两段式逻辑（deleteArmed / confirmClear + 3 秒计时）已全部移除，不要再新增该模式。删除/清空成功用 toast 反馈（FileHubPage 此前没有 toast，随本次一并加入）。
 - **开发时 `tauri dev` 会自动重编译重启**：改 Rust 后用户桌面上的 dev 实例会闪断重连，日志里会出现重连记录，属正常现象。
 

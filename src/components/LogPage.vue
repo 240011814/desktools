@@ -3,15 +3,16 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { LogEntry, LogLevel } from "../store";
+import ConfirmDialog from "./ConfirmDialog.vue";
 
 const LEVELS: Array<LogLevel | "ALL"> = ["ALL", "INFO", "WARN", "ERROR"];
 
 const entries = ref<LogEntry[]>([]);
 const filter = ref<LogLevel | "ALL">("ALL");
 const toast = ref("");
-const confirmClear = ref(false);
+const confirmClearOpen = ref(false);
+const clearing = ref(false);
 let toastTimer: number | undefined;
-let confirmTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
 
 const filtered = computed(() =>
@@ -34,20 +35,20 @@ function showToast(text: string) {
   toastTimer = window.setTimeout(() => (toast.value = ""), 1800);
 }
 
+/** 弹窗确认后清空全部日志 */
 async function clearAll() {
-  if (!confirmClear.value) {
-    confirmClear.value = true;
-    clearTimeout(confirmTimer);
-    confirmTimer = window.setTimeout(() => (confirmClear.value = false), 3000);
-    return;
-  }
-  confirmClear.value = false;
+  if (clearing.value) return;
+  clearing.value = true;
   try {
     await invoke("clear_logs");
     await load();
+    confirmClearOpen.value = false;
     showToast("日志已清空");
   } catch (e) {
+    confirmClearOpen.value = false;
     showToast(`清空失败：${String(e)}`);
+  } finally {
+    clearing.value = false;
   }
 }
 
@@ -69,7 +70,6 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisten?.();
   clearTimeout(toastTimer);
-  clearTimeout(confirmTimer);
 });
 </script>
 
@@ -88,8 +88,8 @@ onUnmounted(() => {
         </div>
         <div class="actions">
           <button :disabled="!entries.length" @click="load">刷新</button>
-          <button class="danger" :disabled="!entries.length" @click="clearAll">
-            {{ confirmClear ? "确认清空？" : "清空日志" }}
+          <button class="danger" :disabled="!entries.length" @click="confirmClearOpen = true">
+            清空日志
           </button>
         </div>
       </div>
@@ -128,6 +128,19 @@ onUnmounted(() => {
         日志同时保存在本机日志文件中（自动轮转），重启应用后仍可查看。
       </p>
     </section>
+
+    <!-- 清空确认弹窗（替代原两段式「确认清空？」按钮） -->
+    <ConfirmDialog
+      v-if="confirmClearOpen"
+      title="确认清空日志"
+      confirm-label="清空"
+      busy-label="清空中…"
+      :busy="clearing"
+      @confirm="clearAll"
+      @cancel="confirmClearOpen = false"
+    >
+      <p>将删除全部 {{ entries.length }} 条日志记录，且无法恢复。</p>
+    </ConfirmDialog>
 
     <div v-if="toast" class="toast">{{ toast }}</div>
   </div>

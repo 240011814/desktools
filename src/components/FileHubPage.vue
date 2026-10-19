@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow, type DragDropEvent } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import ConfirmDialog from "./ConfirmDialog.vue";
 import type { MqttConfig } from "../store";
 
 /** compact：独立文件中转站小窗口布局（桌面右键 / 托盘弹出） */
@@ -47,8 +48,11 @@ const error = ref("");
 const downloadedPath = ref("");
 const clipboardSaved = ref("");
 const transfers = ref<Record<string, Transfer>>({});
-const deleteArmed = ref("");
-let disarmTimer: number | undefined;
+/** 待确认删除的文件（非空时显示确认弹窗） */
+const pendingDelete = ref<HubFile | null>(null);
+const deleting = ref(false);
+const toast = ref("");
+let toastTimer: number | undefined;
 let savedTimer: number | undefined;
 let initialized = false;
 let unlisten: UnlistenFn | undefined;
@@ -216,28 +220,34 @@ async function download(file: HubFile) {
   }
 }
 
-/** 删除需要二次确认：第一次点击进入 3 秒待确认态 */
-function armDelete(key: string) {
-  if (deleteArmed.value === key) {
-    void doDelete(key);
-    return;
-  }
-  deleteArmed.value = key;
-  window.clearTimeout(disarmTimer);
-  disarmTimer = window.setTimeout(() => {
-    deleteArmed.value = "";
-  }, 3000);
+/** 点删除：打开确认弹窗（pendingDelete 非空时由模板渲染 ConfirmDialog） */
+function askDelete(file: HubFile) {
+  pendingDelete.value = file;
 }
 
-async function doDelete(key: string) {
-  deleteArmed.value = "";
+/** 弹窗确认后执行删除：成功 toast + 刷新列表，失败沿用错误条提示 */
+async function confirmDelete() {
+  const file = pendingDelete.value;
+  if (!file || deleting.value) return;
+  deleting.value = true;
   error.value = "";
   try {
-    await invoke("file_hub_delete", { key });
+    await invoke("file_hub_delete", { key: file.key });
+    pendingDelete.value = null;
+    showToast(`已删除 ${file.key}`);
     await refresh();
   } catch (e) {
+    pendingDelete.value = null;
     error.value = `删除失败：${String(e)}`;
+  } finally {
+    deleting.value = false;
   }
+}
+
+function showToast(text: string) {
+  toast.value = text;
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => (toast.value = ""), 1800);
 }
 
 function onProgress(payload: ProgressPayload) {
@@ -325,7 +335,7 @@ onActivated(() => {
 });
 
 onUnmounted(() => {
-  window.clearTimeout(disarmTimer);
+  window.clearTimeout(toastTimer);
   window.clearTimeout(savedTimer);
   window.removeEventListener("focus", onWindowFocus);
   window.removeEventListener("paste", onPaste);
@@ -422,13 +432,7 @@ onUnmounted(() => {
               <td class="time">{{ formatTime(f.lastModified) }}</td>
               <td class="ops">
                 <button class="ghost" @click="download(f)">下载</button>
-                <button
-                  class="ghost"
-                  :class="{ danger: deleteArmed === f.key }"
-                  @click="armDelete(f.key)"
-                >
-                  {{ deleteArmed === f.key ? "确认删除" : "删除" }}
-                </button>
+                <button class="ghost" @click="askDelete(f)">删除</button>
               </td>
             </tr>
           </tbody>
@@ -462,6 +466,25 @@ onUnmounted(() => {
         <p>释放以上传文件到「{{ bucketName }}」</p>
       </div>
     </div>
+
+    <!-- 删除确认弹窗（替代原两段式「点击变确认删除」） -->
+    <ConfirmDialog
+      v-if="pendingDelete"
+      title="确认删除文件"
+      confirm-label="删除"
+      busy-label="删除中…"
+      :busy="deleting"
+      @confirm="confirmDelete"
+      @cancel="pendingDelete = null"
+    >
+      <p class="confirm-file">{{ pendingDelete.key }}</p>
+      <p>
+        {{ formatSize(pendingDelete.size) }} · 修改于 {{ formatTime(pendingDelete.lastModified) }}
+      </p>
+      <p class="confirm-warn">删除后其他设备也将无法下载此文件。</p>
+    </ConfirmDialog>
+
+    <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>
 
@@ -558,9 +581,14 @@ onUnmounted(() => {
   margin-left: 6px;
 }
 
-button.ghost.danger {
+/* 删除确认弹窗内容（slot 由本组件提供样式） */
+.confirm-file {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.confirm-warn {
   color: var(--err);
-  border-color: var(--err);
 }
 
 button.link {
@@ -638,5 +666,32 @@ button.link:hover {
 
 .page.compact .card:last-child {
   margin-bottom: 0;
+}
+
+/* 操作结果提示（删除成功等） */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  z-index: 70;
+  padding: 8px 18px;
+  border-radius: 999px;
+  background: var(--text);
+  color: var(--bg-elevated);
+  font-size: 0.82rem;
+  box-shadow: var(--shadow);
+  animation: fade-in 0.18s ease-out;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }
 </style>

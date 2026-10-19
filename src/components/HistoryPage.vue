@@ -7,6 +7,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { detectContent, type ContentInfo } from "../detect";
 import { renderMarkdown } from "../markdown";
 import type { HistoryItem } from "../store";
+import ConfirmDialog from "./ConfirmDialog.vue";
 
 /** compact：独立历史小窗口布局（桌面右键 / 托盘弹出） */
 defineProps<{ compact?: boolean }>();
@@ -15,9 +16,9 @@ const HISTORY_LIMIT = 200;
 
 const items = ref<HistoryItem[]>([]);
 const toast = ref("");
-const confirmClear = ref(false);
+const confirmClearOpen = ref(false);
+const clearing = ref(false);
 let toastTimer: number | undefined;
-let confirmTimer: number | undefined;
 let unlisten: UnlistenFn | undefined;
 let unlistenRefresh: UnlistenFn | undefined;
 
@@ -81,20 +82,20 @@ async function removeItem(item: HistoryItem) {
   }
 }
 
+/** 弹窗确认后清空全部历史 */
 async function clearAll() {
-  if (!confirmClear.value) {
-    confirmClear.value = true;
-    clearTimeout(confirmTimer);
-    confirmTimer = window.setTimeout(() => (confirmClear.value = false), 3000);
-    return;
-  }
-  confirmClear.value = false;
+  if (clearing.value) return;
+  clearing.value = true;
   try {
     await invoke("clear_history");
     await load();
+    confirmClearOpen.value = false;
     showToast("已清空历史记录");
   } catch (e) {
+    confirmClearOpen.value = false;
     showToast(`清空失败：${String(e)}`);
+  } finally {
+    clearing.value = false;
   }
 }
 
@@ -240,7 +241,6 @@ onUnmounted(() => {
   unlisten?.();
   unlistenRefresh?.();
   clearTimeout(toastTimer);
-  clearTimeout(confirmTimer);
 });
 </script>
 
@@ -259,8 +259,8 @@ onUnmounted(() => {
         </div>
         <div class="actions">
           <button :disabled="!items.length" @click="load">刷新</button>
-          <button class="danger" :disabled="!items.length" @click="clearAll">
-            {{ confirmClear ? "确认清空？" : "一键清空" }}
+          <button class="danger" :disabled="!items.length" @click="confirmClearOpen = true">
+            一键清空
           </button>
         </div>
       </div>
@@ -376,6 +376,19 @@ onUnmounted(() => {
         相同内容不会重复记录，重复复制时会更新时间并置顶；远端同步来的内容标记为「远端同步」。内容类型识别与快捷操作全部在本机完成、不联网。
       </p>
     </section>
+
+    <!-- 清空确认弹窗（替代原两段式「确认清空？」按钮） -->
+    <ConfirmDialog
+      v-if="confirmClearOpen"
+      title="确认清空历史记录"
+      confirm-label="清空"
+      busy-label="清空中…"
+      :busy="clearing"
+      @confirm="clearAll"
+      @cancel="confirmClearOpen = false"
+    >
+      <p>将删除全部 {{ items.length }} 条记录，且无法恢复。</p>
+    </ConfirmDialog>
 
     <!-- 内容预览弹层：JSON 格式化 / Base64 解码 / Markdown 渲染 -->
     <div v-if="preview" class="overlay" @click.self="closePreview">
