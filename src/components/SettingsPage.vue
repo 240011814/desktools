@@ -1171,7 +1171,8 @@ onMounted(() => {
 .keysync-row input,
 .keysync-row select {
   width: 100%;
-  padding: 8px 11px;
+  height: 34px;
+  padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-input);
@@ -1187,6 +1188,11 @@ onMounted(() => {
 .keysync-row select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 原生下拉箭头占据右侧空间，单独加右 padding 避免文字被遮挡 */
+.keysync-row select {
+  padding-right: 22px;
 }
 
 .combo-input.invalid {
