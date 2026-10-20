@@ -1,19 +1,22 @@
 //! 按键同步：一台设备按下配置的按键组合后，经 MQTT（`keysync/<group号>`）通知同组
-//! 设备，各设备按本机启用的规则注入映射后的目标组合（例：Windows 按 Ctrl+↓ → macOS 按 F9）。
+//! 设备注入映射后的目标组合（例：Windows 按 Ctrl+↓ → macOS 按 F9）。
 //!
 //! 设计要点：
 //! - 只同步「规则里配置的组合」，不做全键盘流转发；总开关（`keySyncEnabled`）默认关闭。
 //! - 规则模型：`KeySyncRule { id, enabled, source, target, platform, note }`，
-//!   `source/target` 是「修饰键 + 命名主键」的组合，platform 指明目标组合适用的平台。
-//!   收发两端各自配置源组合一致的规则：发送端按下源组合即广播，接收端按
-//!   「源组合 + 本机平台」匹配本机规则后注入目标组合，不同机器可映射到不同目标键。
+//!   `source/target` 是「修饰键 + 命名主键」的组合，platform 指明该映射适用的接收平台。
+//!   发送端命中规则后广播 `source + target + platform`（`ruleId` 仅用于日志）。
+//!   接收端做两级匹配：
+//!   1) 本机启用规则里存在同源组合且其平台含本机 → 注入**本机规则**的目标
+//!      （每台设备可映射到不同目标键；平台不符记 WARN 忽略，不回退远端映射）；
+//!   2) 本机没有同源规则且消息携带合法 target → 按**发送端映射**直接注入目标组合
+//!      （单向配置即生效；仅当消息 platform 含本机时执行，缺省 / 非法 platform 忽略）。
 //! - 组合必须精确匹配：修饰键多按 / 少按都不命中；修饰键自身不并入主键；同一
 //!   (主键, 修饰键) 只有一条规则命中（同主键多个组合按修饰键数降序取最具体者）。
 //! - 发送端：全局键盘钩子（Windows `WH_KEYBOARD_LL` / macOS listen-only `CGEventTap`）
 //!   在后台与失焦时仍生效；命中后同一组合 300ms 内去重；注入的按键（本机或他人
 //!   SendInput / CGEventPost 产生）不再次广播，防多设备回环。
-//! - 接收端：忽略自身 `deviceId`；规则目标平台不含本机记 WARN 并忽略；MQTT 断线只记
-//!   INFO 不补发（按键事件讲时效，不做重放）。
+//! - 接收端：忽略自身 `deviceId`；MQTT 断线只记 INFO 不补发（按键事件讲时效，不做重放）。
 //! - macOS 权限以 `CGPreflightListenEventAccess / CGPreflightPostEventAccess` 预检为准，
 //!   不调用 CGRequest 弹安全面板；无权限时总开关回退关闭并在 UI 明确提示。
 
@@ -360,13 +363,23 @@ fn rule_label(rule: &KeySyncRule, index: usize) -> String {
     }
 }
 
-/// 规则的目标平台是否包含本机
-pub fn platform_applies(rule: &KeySyncRule, os: &str) -> bool {
-    match rule.platform.as_str() {
+/// 平台串是否为合法取值（windows / macos / all）
+pub fn is_valid_platform(platform: &str) -> bool {
+    matches!(platform, PLATFORM_WINDOWS | PLATFORM_MACOS | PLATFORM_ALL)
+}
+
+/// 平台取值是否包含本机
+pub fn platform_applies_str(platform: &str, os: &str) -> bool {
+    match platform {
         PLATFORM_WINDOWS => os == PLATFORM_WINDOWS,
         PLATFORM_MACOS => os == PLATFORM_MACOS,
         _ => true,
     }
+}
+
+/// 规则的目标平台是否包含本机
+pub fn platform_applies(rule: &KeySyncRule, os: &str) -> bool {
+    platform_applies_str(&rule.platform, os)
 }
 
 /// 本机平台标识（与规则 platform 字段对应）
@@ -517,7 +530,10 @@ pub fn topic(group: &str) -> String {
     format!("{TOPIC_PREFIX}/{}", group.trim())
 }
 
-/// MQTT 按键同步消息：{"deviceId":"...","ruleId":"...","source":"ctrl+down","ts":...}
+/// MQTT 按键同步消息：
+/// `{"deviceId":"...","ruleId":"...","source":"ctrl+down","target":{...},"platform":"macos","ts":...}`
+/// `target / platform` 描述发送端规则的映射（接收端无同源本地规则时按它注入，单向生效）；
+/// 旧版本消息缺这两个字段：`target` 缺省为空组合 → 仅本机规则可命中，行为向后兼容。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeySyncMessage {
@@ -528,14 +544,35 @@ pub struct KeySyncMessage {
     /// 规范化的源组合串
     #[serde(default)]
     pub source: String,
+    /// 发送端规则的目标组合（结构化）
+    #[serde(default)]
+    pub target: KeyCombo,
+    /// 发送端规则的目标平台（windows / macos / all；非法 / 缺省时按空处理）
+    #[serde(default)]
+    pub platform: String,
     #[serde(default)]
     pub ts: i64,
+}
+
+/// 解析后的远端按键同步消息（供接收匹配）
+#[derive(Debug, Clone)]
+pub struct RemoteKeySync {
+    /// 远端按下的源组合
+    pub source: KeyCombo,
+    /// 消息携带的发送端目标组合（缺省 / 非法为 None）
+    pub target: Option<KeyCombo>,
+    /// 发送端规则的目标平台（缺省 / 非法为空串 → 不做远端直注）
+    pub platform: String,
 }
 
 /// 解析远端消息（纯逻辑，供测试）：
 /// - 本机自己发布的 → `Ok(None)`（防回环）
 /// - JSON 解析失败 / 缺 deviceId / 源组合无效 → `Err`（调用方记 WARN）
-pub fn parse_remote_message(raw: &str, own_device_id: &str) -> Result<Option<KeyCombo>, String> {
+/// - `target / platform` 非法时宽容降级（None / 空串），不影响本机规则匹配
+pub fn parse_remote_message(
+    raw: &str,
+    own_device_id: &str,
+) -> Result<Option<RemoteKeySync>, String> {
     let msg: KeySyncMessage =
         serde_json::from_str(raw).map_err(|e| format!("JSON 解析失败：{e}"))?;
     if msg.device_id.trim().is_empty() {
@@ -544,19 +581,75 @@ pub fn parse_remote_message(raw: &str, own_device_id: &str) -> Result<Option<Key
     if msg.device_id == own_device_id {
         return Ok(None);
     }
-    let combo =
+    let source =
         parse_combo(&msg.source).map_err(|e| format!("源组合「{}」无效：{e}", msg.source))?;
-    Ok(Some(combo))
+    let target = if msg.target.key.is_empty() {
+        None
+    } else if combo_error(&msg.target).is_ok() {
+        Some(msg.target)
+    } else {
+        None
+    };
+    let platform = if is_valid_platform(&msg.platform) {
+        msg.platform
+    } else {
+        String::new()
+    };
+    Ok(Some(RemoteKeySync {
+        source,
+        target,
+        platform,
+    }))
 }
 
-/// 处理一条远端按键同步消息（由 MQTT 消息线程调用）：匹配本机启用规则后注入目标组合
+/// 远端消息在本机的处理动作（纯逻辑，供测试与日志分级）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteAction {
+    /// 本机同源规则命中且平台适用：注入**本机规则**的目标组合（本地映射优先）
+    Local(KeySyncRule),
+    /// 本机无同源规则：按消息携带的发送端映射注入目标组合（单向配置即生效）
+    Remote(KeyCombo),
+    /// 本机有同源规则但其目标平台不含本机：明确拒绝（不回退远端映射）
+    PlatformMismatch { platform: String },
+    /// 本机无同源规则且消息未携带可注入目标（旧消息 / 平台不符）：忽略
+    NoLocalRule,
+}
+
+/// 决定远端消息在本机的注入路径（纯逻辑，供测试）：
+/// 结构化规则匹配（source 精确 + platform 适用）→ 本地优先；
+/// 否则消息 target 合法且 platform 含本机 → 远端映射；否则忽略。
+pub fn resolve_remote_action(
+    remote: &RemoteKeySync,
+    rules: &[KeySyncRule],
+    os: &str,
+) -> RemoteAction {
+    let active = ActiveRules::build(rules);
+    if let Some(rule) = active.lookup(&remote.source.key, remote.source.mask()) {
+        if platform_applies(rule, os) {
+            return RemoteAction::Local(rule.clone());
+        }
+        return RemoteAction::PlatformMismatch {
+            platform: rule.platform.clone(),
+        };
+    }
+    if let Some(target) = &remote.target
+        && is_valid_platform(&remote.platform)
+        && platform_applies_str(&remote.platform, os)
+    {
+        return RemoteAction::Remote(target.clone());
+    }
+    RemoteAction::NoLocalRule
+}
+
+/// 处理一条远端按键同步消息（由 MQTT 消息线程调用）：
+/// 本机有同源规则 → 注入本机目标；无本机规则 → 按发送端映射注入（单向）。
 pub fn handle_remote_message(app: &AppHandle, raw: &str) {
     let cfg = app.state::<SyncState>().config.lock().unwrap().clone();
     if !cfg.key_sync_enabled {
         return; // 防御：总开关关闭时本就未订阅该 topic
     }
-    let combo = match parse_remote_message(raw, &cfg.device_id) {
-        Ok(Some(combo)) => combo,
+    let remote = match parse_remote_message(raw, &cfg.device_id) {
+        Ok(Some(remote)) => remote,
         Ok(None) => return,
         Err(err) => {
             logger::log(
@@ -572,57 +665,75 @@ pub fn handle_remote_message(app: &AppHandle, raw: &str) {
     };
 
     let os = os_name();
-    let active = ActiveRules::build(&cfg.key_sync_rules);
-    let Some(rule) = active.lookup(&combo.key, combo.mask()) else {
-        logger::log(
-            app,
-            INFO,
-            format!(
-                "按键同步：远端 {}，本机未配置对应规则，忽略",
-                display_combo(&combo, os)
-            ),
-        );
-        return;
-    };
-    if !platform_applies(rule, os) {
-        logger::log(
+    let device = remote_device_of(raw).unwrap_or_default();
+    let action = resolve_remote_action(&remote, &cfg.key_sync_rules, os);
+    match action {
+        RemoteAction::Local(rule) => {
+            inject_remote_combo(
+                app,
+                os,
+                &device,
+                &remote.source,
+                &rule.target,
+                &format!("按本机规则 {} 注入", rule_display_id(&rule)),
+            );
+        }
+        RemoteAction::Remote(target) => {
+            inject_remote_combo(
+                app,
+                os,
+                &device,
+                &remote.source,
+                &target,
+                "本机未配置同源规则，按发送端映射注入",
+            );
+        }
+        RemoteAction::PlatformMismatch { platform } => logger::log(
             app,
             WARN,
             format!(
-                "按键同步：规则「{}」目标平台为 {}，不适用于本机，忽略远端 {}",
-                if rule.note.trim().is_empty() {
-                    &rule.id
-                } else {
-                    rule.note.trim()
-                },
-                rule.platform,
-                display_combo(&combo, os)
+                "按键同步：本机同源规则的目标平台为 {}，不适用于本机，忽略远端 {}",
+                platform,
+                display_combo(&remote.source, os)
             ),
-        );
-        return;
+        ),
+        RemoteAction::NoLocalRule => logger::log(
+            app,
+            INFO,
+            format!(
+                "按键同步：远端 {}，本机未配置对应规则，消息也未携带可注入的映射，忽略",
+                display_combo(&remote.source, os)
+            ),
+        ),
     }
+}
 
+/// 命中后的注入路径（本地规则 / 远端映射共用）：先标记抑制再注入（防回环），并记录日志
+fn inject_remote_combo(
+    app: &AppHandle,
+    os: &str,
+    device: &str,
+    source: &KeyCombo,
+    target: &KeyCombo,
+    action_desc: &str,
+) {
     let state = app.state::<KeySyncState>();
-    let device = remote_device_of(raw).unwrap_or_default();
     // 先标记抑制再注入：注入产生的本机按键事件不被钩子再次广播（防回环）
-    state.mark_injected(&rule.target.canonical());
-    match inject_combo(&rule.target) {
+    state.mark_injected(&target.canonical());
+    match inject_combo(target) {
         Ok(()) => logger::log(
             app,
             INFO,
             format!(
-                "按键同步：收到设备 {device} 的 {}，已注入 {}",
-                display_combo(&combo, os),
-                display_combo(&rule.target, os)
+                "按键同步：收到设备 {device} 的 {}，{action_desc} {}",
+                display_combo(source, os),
+                display_combo(target, os)
             ),
         ),
         Err(err) => logger::log(
             app,
             ERROR,
-            format!(
-                "按键同步：注入 {} 失败：{err}",
-                display_combo(&rule.target, os)
-            ),
+            format!("按键同步：注入 {} 失败：{err}", display_combo(target, os)),
         ),
     }
 }
@@ -670,6 +781,8 @@ pub fn publish_press(app: &AppHandle, rule: &KeySyncRule) {
         "deviceId": device_id,
         "ruleId": rule.id,
         "source": combo,
+        "target": rule.target,
+        "platform": rule.platform,
         "ts": now_ms(),
     })
     .to_string();
@@ -1602,6 +1715,13 @@ mod macos_impl {
         let api = api()?;
         let keycode = keycode_for_key(&combo.key)
             .ok_or_else(|| format!("目标主键「{}」不受支持", combo.key))?;
+        // CGEventPost 无返回值，权限缺失时事件被系统静默丢弃：这里显式预检，
+        // 让单键 / 单向接收（未安装监听 tap → 未跑过启动预检）的场景得到明确提示
+        if let Some(check) = api.preflight_post
+            && unsafe { !check() }
+        {
+            return Err(permission_hint());
+        }
         let flags = mask_to_flags(combo.mask());
         unsafe {
             let down = (api.event_create)(std::ptr::null_mut(), keycode, true);
@@ -1814,14 +1934,23 @@ mod tests {
 
     #[test]
     fn message_serde_uses_camel_case() {
-        let json = r#"{"deviceId":"d1","ruleId":"r1","source":"ctrl+down","ts":123}"#;
-        let msg: KeySyncMessage = serde_json::from_str(json).unwrap();
+        // 新版本消息：携带 target（结构化）与 platform；字段名 camelCase
+        let full = r#"{"deviceId":"d1","ruleId":"r1","source":"ctrl+down","target":{},"platform":"macos","ts":123}"#;
+        let msg: KeySyncMessage = serde_json::from_str(full).unwrap();
         assert_eq!(msg.device_id, "d1");
         assert_eq!(msg.rule_id, "r1");
         assert_eq!(msg.source, "ctrl+down");
-        let combo = parse_remote_message(json, "d2").unwrap().unwrap();
-        assert_eq!(combo.key, "down");
-        assert_eq!(combo.mask(), MOD_CTRL);
+        assert_eq!(msg.platform, "macos");
+
+        let remote = parse_remote_message(full, "d2").unwrap().unwrap();
+        assert_eq!(remote.source.key, "down");
+        assert_eq!(remote.source.mask(), MOD_CTRL);
+        // 旧版本消息缺 target / platform：宽容降级（仅本机规则可命中）
+        let legacy = r#"{"deviceId":"d1","ruleId":"r1","source":"ctrl+down","ts":123}"#;
+        let remote = parse_remote_message(legacy, "d2").unwrap().unwrap();
+        assert_eq!(remote.source.key, "down");
+        assert!(remote.target.is_none());
+        assert!(remote.platform.is_empty());
     }
 
     #[test]
@@ -1835,6 +1964,91 @@ mod tests {
         assert!(parse_remote_message("not json", "me").is_err());
         assert!(parse_remote_message(r#"{"source":"ctrl+down"}"#, "me").is_err());
         assert!(parse_remote_message(r#"{"deviceId":"d","source":"ctrl++"}"#, "me").is_err());
+        // target 非法不整条报错：宽容降级为 None（仍可走本机规则）
+        let bad_target = parse_remote_message(
+            r#"{"deviceId":"d","source":"ctrl+down","target":{"key":"Space"}}"#,
+            "me",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(bad_target.target.is_none());
+    }
+
+    #[test]
+    fn resolve_remote_local_rule_wins() {
+        // 本机同源规则命中且平台适用 → 本地映射优先（不用远端 target）
+        let rules = vec![rule("local", true, "f9", "F10", PLATFORM_ALL, "本机")];
+        let remote = RemoteKeySync {
+            source: combo("f9"),
+            target: Some(combo("F12")),
+            platform: PLATFORM_MACOS.into(),
+        };
+        assert_eq!(
+            resolve_remote_action(&remote, &rules, "macos"),
+            RemoteAction::Local(rules[0].clone())
+        );
+    }
+
+    #[test]
+    fn resolve_remote_fallback_injects_remote_target() {
+        // 本机无同源规则 + 消息 platform 含本机 → 按发送端映射注入（单向生效）
+        let remote = RemoteKeySync {
+            source: combo("ctrl+down"),
+            target: Some(combo("F9")),
+            platform: PLATFORM_MACOS.into(),
+        };
+        assert_eq!(
+            resolve_remote_action(&remote, &[], "macos"),
+            RemoteAction::Remote(combo("F9"))
+        );
+        // 平台不符（仅 macOS 的映射，Windows 设备不直注）
+        assert_eq!(
+            resolve_remote_action(&remote, &[], "windows"),
+            RemoteAction::NoLocalRule
+        );
+        // platform 缺省 / 非法 → 不直注
+        assert_eq!(
+            resolve_remote_action(
+                &RemoteKeySync {
+                    source: combo("ctrl+down"),
+                    target: Some(combo("F9")),
+                    platform: String::new(),
+                },
+                &[],
+                "macos"
+            ),
+            RemoteAction::NoLocalRule
+        );
+        // 无 remote target（旧消息）→ 忽略
+        assert_eq!(
+            resolve_remote_action(
+                &RemoteKeySync {
+                    source: combo("ctrl+down"),
+                    target: None,
+                    platform: PLATFORM_ALL.into(),
+                },
+                &[],
+                "macos"
+            ),
+            RemoteAction::NoLocalRule
+        );
+    }
+
+    #[test]
+    fn resolve_remote_local_platform_mismatch_never_falls_back() {
+        // 本机虽有同源规则但平台不含本机：明确拒绝，不回退远端映射
+        let rules = vec![rule("win-only", true, "f9", "F10", PLATFORM_WINDOWS, "x")];
+        let remote = RemoteKeySync {
+            source: combo("f9"),
+            target: Some(combo("F12")),
+            platform: PLATFORM_ALL.into(),
+        };
+        assert_eq!(
+            resolve_remote_action(&remote, &rules, "macos"),
+            RemoteAction::PlatformMismatch {
+                platform: PLATFORM_WINDOWS.into()
+            }
+        );
     }
 
     #[test]
