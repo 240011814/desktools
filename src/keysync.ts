@@ -95,8 +95,8 @@ export function displayKey(key: string): string {
   }
 }
 
-/** 按平台显示组合（Windows 用 Win、macOS 用 Cmd/Option、其余用 Super） */
-export function displayCombo(combo: KeyCombo, os: string): string {
+/** 修饰键显示名（按平台：Alt/Option、Win/Cmd/Super） */
+function modifierParts(combo: KeyCombo, os: string): string[] {
   const parts: string[] = [];
   if (combo.ctrl) parts.push("Ctrl");
   if (combo.alt) parts.push(os === PLATFORM_MACOS ? "Option" : "Alt");
@@ -106,8 +106,31 @@ export function displayCombo(combo: KeyCombo, os: string): string {
       os === PLATFORM_MACOS ? "Cmd" : os === PLATFORM_WINDOWS ? "Win" : "Super",
     );
   }
-  parts.push(displayKey(combo.key));
-  return parts.join("+");
+  return parts;
+}
+
+/** 按平台显示组合（Windows 用 Win、macOS 用 Cmd/Option、其余用 Super） */
+export function displayCombo(combo: KeyCombo, os: string): string {
+  return [...modifierParts(combo, os), displayKey(combo.key)].join("+");
+}
+
+/** 仅修饰键的前缀文本（无主键时显示，如「Ctrl+」「Ctrl+Shift+」；
+ * 速选修饰键后等待点选主键，保证仍可被 parseModifierPrefix 解析） */
+export function modifierPrefixText(combo: KeyCombo, os: string): string {
+  const parts = modifierParts(combo, os);
+  return parts.length ? `${parts.join("+")}+` : "";
+}
+
+/** 切换组合中的某个修饰键（保留主键与其余修饰键），返回新组合。
+ * 供「主键速选」旁的修饰键按钮叠加 / 取消使用（如点 Ctrl 再点 ↓ → Ctrl+↓） */
+export function withModifierToggled(combo: KeyCombo, mask: number): KeyCombo {
+  return {
+    ctrl: mask & MOD_CTRL ? !combo.ctrl : combo.ctrl,
+    alt: mask & MOD_ALT ? !combo.alt : combo.alt,
+    shift: mask & MOD_SHIFT ? !combo.shift : combo.shift,
+    meta: mask & MOD_META ? !combo.meta : combo.meta,
+    key: combo.key,
+  };
 }
 
 /** 主键名归一化：仅支持字母 / 数字 / F1~F12 / 方向 / PageUp / PageDown / Home / End。
@@ -234,6 +257,10 @@ export function parseComboText(input: string): KeyCombo | string {
   }
   const key = normalizeKeyName(main);
   if (!key) {
+    if (modifierMaskOf(main) !== 0) {
+      // 「Ctrl+」「Cmd+Shift+」这类未完成写法：别让用户误以为修饰键本身不合法
+      return `组合缺少主键：「${main}」是修饰键，请再加一个主键（如 ${main}+F9 或 ${main}+↓）`;
+    }
     return `无法识别的主键「${main}」（支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）`;
   }
   combo.key = key;

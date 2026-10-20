@@ -13,6 +13,7 @@ import {
   displayCombo,
   emptyCombo,
   isModifierOnlyKey,
+  modifierPrefixText,
   MOD_CTRL,
   MOD_META,
   MOD_SHIFT,
@@ -25,6 +26,7 @@ import {
   PLATFORM_WINDOWS,
   previewCombo,
   validateRule,
+  withModifierToggled,
   type KeySyncRule,
 } from "../src/keysync.ts";
 
@@ -116,7 +118,7 @@ test("parse: 变体写法（Rust parse_combo_variants 对应）", () => {
 
 test("parse: 非法输入报错（Rust parse_combo_rejects_invalid 对应）", () => {
   assert.equal(parseComboText("   "), "按键组合为空");
-  assert.match(String(parseComboText("ctrl++")), /无法识别的主键「ctrl」/);
+  assert.match(String(parseComboText("ctrl++")), /组合缺少主键/);
   assert.match(String(parseComboText("Ctrl+Space")), /无法识别的主键/);
   assert.match(String(parseComboText("Foo+Down")), /无法识别的修饰键/);
   assert.match(String(parseComboText("Alt+ArrowLeft&&")), /无法识别的主键/);
@@ -257,4 +259,46 @@ test("previewCombo: 仅修饰键时给出提示", () => {
     previewCombo({ ctrlKey: false, altKey: false, shiftKey: false, metaKey: false }, "windows"),
     "",
   );
+});
+
+test("withModifierToggled: 叠加 / 取消修饰键并保留主键", () => {
+  // 单键 ↓ 点 Ctrl → Ctrl+↓
+  assert.deepEqual(withModifierToggled(combo("down"), MOD_CTRL), combo("ctrl+down"));
+  // Ctrl+↓ 点 Ctrl → ↓（取消）
+  assert.deepEqual(withModifierToggled(combo("ctrl+down"), MOD_CTRL), combo("down"));
+  // Ctrl+↓ 点 Shift → Ctrl+Shift+↓（叠加）
+  assert.deepEqual(withModifierToggled(combo("ctrl+down"), MOD_SHIFT), combo("ctrl+shift+down"));
+  // 空组合点 Cmd → 只有修饰键、主键为空
+  assert.deepEqual(withModifierToggled(emptyCombo(), MOD_META), {
+    ...emptyCombo(),
+    meta: true,
+  });
+});
+
+test("modifierPrefixText: 未选主键时按平台显示前缀", () => {
+  assert.equal(modifierPrefixText({ ...emptyCombo(), ctrl: true }, "macos"), "Ctrl+");
+  assert.equal(
+    modifierPrefixText({ ...emptyCombo(), ctrl: true, shift: true }, "macos"),
+    "Ctrl+Shift+",
+  );
+  assert.equal(modifierPrefixText({ ...emptyCombo(), alt: true }, "macos"), "Option+");
+  assert.equal(modifierPrefixText({ ...emptyCombo(), alt: true }, "windows"), "Alt+");
+  assert.equal(modifierPrefixText({ ...emptyCombo(), meta: true }, "macos"), "Cmd+");
+  assert.equal(modifierPrefixText({ ...emptyCombo(), meta: true }, "windows"), "Win+");
+  assert.equal(modifierPrefixText(emptyCombo(), "macos"), "");
+  // 前缀必须能被 parseModifierPrefix 还原（速选修饰键 → 点主键的链路）
+  assert.deepEqual(parseModifierPrefix(modifierPrefixText({ ...emptyCombo(), ctrl: true, alt: true }, "macos")), {
+    ...emptyCombo(),
+    ctrl: true,
+    alt: true,
+  });
+});
+
+test("parseComboText: 只有修饰键时提示缺少主键", () => {
+  assert.match(parseComboText("Ctrl+") as string, /缺少主键/);
+  assert.match(parseComboText("Ctrl+Shift+") as string, /缺少主键/);
+  assert.match(parseComboText("Cmd+") as string, /缺少主键/);
+  // 正常的修饰键 + 主键不受影响
+  assert.deepEqual(parseComboText("Ctrl+F9"), combo("ctrl+f9"));
+  assert.deepEqual(parseComboText("f9"), combo("f9"));
 });

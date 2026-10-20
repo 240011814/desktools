@@ -5,13 +5,21 @@ import { platform } from "@tauri-apps/plugin-os";
 import { mqttStatus, type KeyCombo, type KeySyncRule, type MqttConfig, type MinioConfig } from "../store";
 import {
   comboFromEvent,
+  comboMask,
   displayCombo,
   emptyCombo,
   isModifierOnlyKey,
+  modifierPrefixText,
   parseComboText,
   parseModifierPrefix,
   previewCombo,
   validateRule,
+  withModifierToggled,
+  MOD_ALT,
+  MOD_CTRL,
+  MOD_META,
+  MOD_SHIFT,
+  PLATFORM_MACOS,
 } from "../keysync";
 import { useToast } from "../toast";
 
@@ -383,6 +391,17 @@ function comboKeyup(e: KeyboardEvent, row: KeysyncRow, field: "source" | "target
 /** 失焦：把当前文本解析提交；解析失败恢复旧组合展示 + 保留行错误 */
 function comboBlur(row: KeysyncRow, field: "source" | "target") {
   const text = (field === "source" ? row.sourceText : row.targetText).trim();
+  const slot = field === "source" ? "sourceText" : "targetText";
+  const err = field === "source" ? "sourceError" : "targetError";
+  // 纯修饰键前缀（含录制预览「Ctrl+…」）：属于「等待点选主键」的中间态，
+  // 保留前缀（如「Ctrl+」）而不是清掉——配合修饰键按钮 / F 键下拉 / 主键速选继续组合
+  const base = text.endsWith("…") ? text.slice(0, -1) : text;
+  const prefix = parseModifierPrefix(base);
+  if (prefix) {
+    row[slot] = modifierPrefixText(prefix, osName);
+    row[err] = "";
+    return;
+  }
   if (text.endsWith("…")) {
     restoreComboText(row, field);
     return;
@@ -398,7 +417,6 @@ function comboBlur(row: KeysyncRow, field: "source" | "target") {
   } else {
     // 解析成功但写法可能不规范（如 PgUp → PageUp），统一成规范展示
     const combo = field === "source" ? row.sourceCombo : row.targetCombo;
-    const slot = field === "source" ? "sourceText" : "targetText";
     if (row[slot] !== comboText(combo)) {
       row[slot] = comboText(combo);
       scheduleKeySyncSave();
@@ -445,6 +463,34 @@ const QUICK_KEYS: Array<[string, string]> = [
   ["end", "End"],
 ];
 
+/** 速选通用（非鼠标路径，如 F 键下拉）：沿用输入框里的修饰键前缀 / 已有组合的修饰键，
+ * 只替换主键（框内为空 → 单键映射） */
+function pickQuickKeyByText(row: KeysyncRow, field: "source" | "target", keyName: string) {
+  const slot = field === "source" ? "sourceText" : "targetText";
+  const text = row[slot].trim();
+  const base = text.endsWith("…") ? text.slice(0, -1) : text;
+  const prefix = parseModifierPrefix(base);
+  if (prefix) {
+    applyCombo(row, field, { ...prefix, key: keyName });
+    return;
+  }
+  const parsed = parseComboText(base);
+  applyCombo(
+    row,
+    field,
+    typeof parsed === "string" ? { ...emptyCombo(), key: keyName } : { ...parsed, key: keyName },
+  );
+}
+
+/** F 键下拉选择（F1~F12）：macOS 顶排 F 键默认被媒体键接管，按 F9 录不进来时用这里选 */
+function pickFKey(e: Event, row: KeysyncRow, field: "source" | "target") {
+  const select = e.target as HTMLSelectElement;
+  const value = select.value;
+  select.value = ""; // 复位占位，同一个 F 键可反复选
+  if (!value) return;
+  pickQuickKeyByText(row, field, value);
+}
+
 /** 点击主键速选：构造「输入框现有修饰键（或鼠标按着的修饰键）+ 该主键」的组合。
  * 修饰键来源优先级：鼠标点击时物理按着的 > 输入框文本（含 `Ctrl+` 未完前缀）> 无；
  * 框为空且未按修饰键时即产生单键映射（无修饰键） */
@@ -478,6 +524,43 @@ function pickQuickKey(
   }
   applyCombo(row, field, combo);
   (e.currentTarget as HTMLElement | null)?.blur();
+}
+
+/** 当前输入框里生效的修饰键（速选修饰键按钮的叠加基础与高亮状态）。
+ * 兼容录制预览「Ctrl+…」：去掉省略号后按未完成前缀解析 */
+function comboModifierState(row: KeysyncRow, field: "source" | "target"): KeyCombo {
+  const text = (field === "source" ? row.sourceText : row.targetText).trim();
+  const base = text.endsWith("…") ? text.slice(0, -1) : text;
+  const prefix = parseModifierPrefix(base);
+  if (prefix) return prefix;
+  const parsed = parseComboText(base);
+  return typeof parsed === "string" ? emptyCombo() : parsed;
+}
+
+/** 速选修饰键：在当前组合上增删该修饰键；尚未选主键时只显示前缀（如「Ctrl+」），
+ * 之后再点方向键等主键即可组合（macOS 系统快捷键会吞掉录制，用这个绕开） */
+function toggleQuickModifier(row: KeysyncRow, field: "source" | "target", mask: number) {
+  const combo = withModifierToggled(comboModifierState(row, field), mask);
+  if (combo.key) {
+    applyCombo(row, field, combo);
+    return;
+  }
+  const slot = field === "source" ? "sourceText" : "targetText";
+  const err = field === "source" ? "sourceError" : "targetError";
+  row[slot] = modifierPrefixText(combo, osName);
+  row[err] = "";
+}
+
+/** macOS：Ctrl+左键被系统当作右键（只派发 contextmenu，没有 click）→ 在 mousedown 补一次速选 */
+function quickKeyMousedown(
+  e: MouseEvent,
+  row: KeysyncRow,
+  field: "source" | "target",
+  keyName: string,
+) {
+  if (osName !== PLATFORM_MACOS || e.button !== 0 || !e.ctrlKey) return;
+  e.preventDefault();
+  pickQuickKey(e, row, field, keyName);
 }
 
 async function saveKeySync() {
@@ -560,6 +643,14 @@ const osName = (() => {
     return "unknown";
   }
 })();
+
+/** 主键速选旁的修饰键速选（canonical 掩码 → 显示名，按平台命名） */
+const quickMods: Array<[number, string]> = [
+  [MOD_CTRL, "Ctrl"],
+  [MOD_ALT, osName === PLATFORM_MACOS ? "Option" : "Alt"],
+  [MOD_SHIFT, "Shift"],
+  [MOD_META, osName === PLATFORM_MACOS ? "Cmd" : osName === "windows" ? "Win" : "Super"],
+];
 
 const integrationTitle = osName === "windows" ? "桌面右键菜单" : "Finder 快速操作";
 const integrationDesc =
@@ -965,16 +1056,42 @@ onMounted(() => {
             />
             <div class="keysync-quick">
               <button
+                v-for="[mask, label] in quickMods"
+                :key="mask"
+                type="button"
+                class="quick-key mod-key"
+                :class="{ active: (comboMask(comboModifierState(row, 'source')) & mask) !== 0 }"
+                :disabled="keySyncBusy"
+                :title="`叠加 / 取消 ${label}，再点下方主键`"
+                @mousedown.prevent
+                @contextmenu.prevent
+                @click="toggleQuickModifier(row, 'source', mask)"
+              >
+                {{ label }}
+              </button>
+              <span class="quick-divider" aria-hidden="true"></span>
+              <button
                 v-for="[value, label] in QUICK_KEYS"
                 :key="value"
                 type="button"
                 class="quick-key"
                 :disabled="keySyncBusy"
-                @mousedown.prevent
+                :title="`填入主键 ${label}（保留已选修饰键）`"
+                @mousedown.prevent="quickKeyMousedown($event, row, 'source', value)"
+                @contextmenu.prevent
                 @click="pickQuickKey($event, row, 'source', value)"
               >
                 {{ label }}
               </button>
+              <select
+                class="fkey-select"
+                :disabled="keySyncBusy"
+                title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
+                @change="pickFKey($event, row, 'source')"
+              >
+                <option value="" selected>F…</option>
+                <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
+              </select>
             </div>
             <p v-if="row.sourceError" class="row-err">{{ row.sourceError }}</p>
           </div>
@@ -996,16 +1113,42 @@ onMounted(() => {
             />
             <div class="keysync-quick">
               <button
+                v-for="[mask, label] in quickMods"
+                :key="mask"
+                type="button"
+                class="quick-key mod-key"
+                :class="{ active: (comboMask(comboModifierState(row, 'target')) & mask) !== 0 }"
+                :disabled="keySyncBusy"
+                :title="`叠加 / 取消 ${label}，再点下方主键`"
+                @mousedown.prevent
+                @contextmenu.prevent
+                @click="toggleQuickModifier(row, 'target', mask)"
+              >
+                {{ label }}
+              </button>
+              <span class="quick-divider" aria-hidden="true"></span>
+              <button
                 v-for="[value, label] in QUICK_KEYS"
                 :key="value"
                 type="button"
                 class="quick-key"
                 :disabled="keySyncBusy"
-                @mousedown.prevent
+                :title="`填入主键 ${label}（保留已选修饰键）`"
+                @mousedown.prevent="quickKeyMousedown($event, row, 'target', value)"
+                @contextmenu.prevent
                 @click="pickQuickKey($event, row, 'target', value)"
               >
                 {{ label }}
               </button>
+              <select
+                class="fkey-select"
+                :disabled="keySyncBusy"
+                title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
+                @change="pickFKey($event, row, 'target')"
+              >
+                <option value="" selected>F…</option>
+                <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
+              </select>
             </div>
             <p v-if="row.targetError" class="row-err">{{ row.targetError }}</p>
           </div>
@@ -1048,10 +1191,14 @@ onMounted(() => {
         不同按键。目标平台选「全部」时，同组里未单独配置规则的所有设备都会执行注入。
         目标组合也支持<strong>单键</strong>（如仅 F9 / 仅 ↓，点下方主键按钮直接填入）。
         组合框支持按下录制与手动键入键名（回车或失焦提交）；<b>方向键 ↑↓←→、Home、End
-        用输入框下方的按钮点选</b>。macOS 说明：Ctrl+↑↓ / Ctrl+←→ / Ctrl+Space 等被系统
-        快捷键（调度中心 / 切换空间 / 输入法）优先处理，直接按键录不到——请用按钮或键名
-        输入，或到「系统设置 → 键盘 → 键盘快捷键」临时停用对应项后录制；安装引擎需允许
-        键盘事件监听（系统设置 → 隐私与安全性 → 输入监视，勾选 desktools 后重新打开总开关）。
+        等系统易占用的组合：先点输入框下方的 Ctrl / Option / Shift / Cmd 再点 ↑↓←→</b>
+        （修饰键按钮会高亮，可叠加；也可按住修饰键直接点主键）。<b>F 键</b>用速选栏末尾的
+        「F…」下拉选择（F1~F12），也可直接键入「f9」。macOS 说明：Ctrl+↑↓ /
+        Ctrl+←→ / Ctrl+Space 等被系统快捷键（调度中心 / 切换空间 / 输入法）优先处理，直接按键
+        录不到——请用上述速选按钮或键名输入，或到「系统设置 → 键盘 → 键盘快捷键」临时停用
+        对应项后录制；顶排 F 键默认是媒体键（按 F9 不产生 F9），请用「F…」下拉 / 键入 `f9`
+        或按住 Fn 再按；安装引擎需允许键盘事件监听（系统设置 → 隐私与安全性 → 输入监视，
+        勾选 desktools 后重新打开总开关）。
       </p>
     </section>
 
@@ -1233,6 +1380,35 @@ onMounted(() => {
 }
 
 .quick-key:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* 修饰键速选：点选后高亮；与主键速选之间用分隔线区分 */
+.mod-key.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.quick-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: 1px 2px;
+  background: var(--border);
+}
+
+/* F 键下拉（样式做成速选按钮的模样，避免整行 select 尺寸） */
+.keysync-row select.fkey-select {
+  width: auto;
+  height: auto;
+  padding: 1px 4px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  border-radius: 7px;
+}
+
+.keysync-row select.fkey-select:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--accent);
 }
