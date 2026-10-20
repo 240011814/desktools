@@ -53,6 +53,17 @@ pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 /// 文本上限的 4 倍，覆盖 JSON 转义（引号 / 换行 / 控制字符转义与信封字段）的膨胀。
 pub const MAX_PAYLOAD_BYTES: usize = MAX_TEXT_BYTES * 4;
 
+/// rumqttc 的默认收发上限只有 10KB，错误文案却写成「broker's maximum packet size」。
+/// 必须显式放宽，否则超过 10KB 的文本会在发送/接收时触发断线重连。
+/// 按 512KB 文本上限 + 64KB 信封余量（topic / 固定头 / JSON 转义）。
+const MQTT_MAX_PACKET_BYTES: usize = MAX_TEXT_BYTES + 64 * 1024;
+
+/// 实际报文 = topic + 固定头 + JSON payload；超出客户端上限时不要发布，
+/// 否则 rumqttc 会直接断开连接（表现为无限重连）。
+fn packet_fits(payload_len: usize, topic_len: usize) -> bool {
+    payload_len + topic_len + 16 <= MQTT_MAX_PACKET_BYTES
+}
+
 /// 消息队列中的待处理消息（按订阅 topic 分型）
 #[derive(Debug, PartialEq)]
 pub enum QueuedMsg {
@@ -179,6 +190,25 @@ pub fn set_status(app: &AppHandle, state: &str, message: impl Into<String>, topi
     let _ = app.emit(STATUS_EVENT, status);
 }
 
+/// 构造 MQTT 连接参数：集中设置报文上限，避免默认 10KB 限制导致大文本同步断线。
+fn mqtt_options(cfg: &MqttConfig) -> MqttOptions {
+    let mut opts = MqttOptions::new(
+        format!("desktools-{}", cfg.device_id),
+        cfg.host.trim().to_string(),
+        cfg.port,
+    );
+    opts.set_keep_alive(Duration::from_secs(30));
+    opts.set_clean_session(true);
+    opts.set_max_packet_size(MQTT_MAX_PACKET_BYTES, MQTT_MAX_PACKET_BYTES);
+    if cfg.tls {
+        opts.set_transport(Transport::tls_with_default_config());
+    }
+    if !cfg.username.trim().is_empty() {
+        opts.set_credentials(cfg.username.trim().to_string(), cfg.password.clone());
+    }
+    opts
+}
+
 /// 断开旧连接并按新配置启动 MQTT 连接（自动订阅 texthub/<group>）
 pub fn start(app: AppHandle, cfg: MqttConfig) {
     let sync = app.state::<SyncState>();
@@ -205,19 +235,7 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
     );
 
     tauri::async_runtime::spawn(async move {
-        let mut opts = MqttOptions::new(
-            format!("desktools-{}", cfg.device_id),
-            cfg.host.trim().to_string(),
-            cfg.port,
-        );
-        opts.set_keep_alive(Duration::from_secs(30));
-        opts.set_clean_session(true);
-        if cfg.tls {
-            opts.set_transport(Transport::tls_with_default_config());
-        }
-        if !cfg.username.trim().is_empty() {
-            opts.set_credentials(cfg.username.trim().to_string(), cfg.password.clone());
-        }
+        let opts = mqtt_options(&cfg);
 
         let (client, mut eventloop) = AsyncClient::new(opts, 64);
         {
@@ -503,6 +521,20 @@ pub fn spawn_clipboard_watcher(app: AppHandle) {
                     })
                     .to_string();
                     let topic = cfg.topic();
+                    if !packet_fits(payload.len(), topic.len()) {
+                        logger::log(
+                            &app,
+                            WARN,
+                            format!(
+                                "同步内容超出 MQTT 报文上限（{} 字节 > {} KB），本次不同步；请缩短内容后重试",
+                                payload.len() + topic.len() + 16,
+                                MQTT_MAX_PACKET_BYTES / 1024
+                            ),
+                        );
+                        // 记入基准，避免每 700ms 重复尝试与告警；内容仍保留在历史里
+                        *last_clip.lock().unwrap() = text.clone();
+                        return;
+                    }
                     tauri::async_runtime::spawn(async move {
                         let _ = client
                             .publish(topic, QoS::AtLeastOnce, false, payload)
@@ -610,5 +642,23 @@ mod tests {
             MAX_PAYLOAD_BYTES
         );
         assert!(payload.len() > MAX_PAYLOAD_BYTES / 2); // 门槛确实兜住了转义膨胀
+    }
+
+    #[test]
+    fn mqtt_packet_limit_covers_sync_payload() {
+        let opts = mqtt_options(&MqttConfig::default());
+        // rumqttc 默认 10KB 会把超过 ~10KB 的文本当成「超过 broker 上限」断开连接；
+        // 这里守住收发上限必须与 512KB 文本上限 + 信封余量一致。
+        assert_eq!(opts.max_packet_size(), MQTT_MAX_PACKET_BYTES);
+        assert!(packet_fits(MAX_TEXT_BYTES, "texthub/hy".len()));
+    }
+
+    #[test]
+    fn packet_guard_rejects_oversized_json_envelope() {
+        // 512KB 全是换行时，JSON 转义后约 1MB，超过客户端报文上限；
+        // 必须在发布前拦截，否则会把 MQTT 连接打断。
+        let text = "\n".repeat(MAX_TEXT_BYTES);
+        let payload = serde_json::json!({ "deviceId": "d", "text": text, "ts": 0 }).to_string();
+        assert!(!packet_fits(payload.len(), "texthub/hy".len()));
     }
 }
