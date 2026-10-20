@@ -656,13 +656,6 @@ pub fn run() {
             file_hub_delete
         ])
         .setup(|app| {
-            // 启动自检：macOS「模拟按键」权限自修复（签名异常时自动重签并重启）
-            #[cfg(target_os = "macos")]
-            if key_sync::startup_self_heal(app.handle()) == key_sync::StartupHeal::Relaunching {
-                app.handle().exit(0);
-                return Ok(());
-            }
-
             // 托盘图标与菜单（右键菜单可直接弹出剪贴板历史窗口）
             let history_item = MenuItem::with_id(app, "history", "剪贴板历史", true, None::<&str>)?;
             let files_item = MenuItem::with_id(app, "files", "文件中转站", true, None::<&str>)?;
@@ -719,6 +712,13 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join("desktools.jsonl");
             app.manage(LogState::load(log_path));
+            // 启动自检：macOS「模拟按键」权限自修复（签名异常时自动重签并重启）
+            // 放在 LogState 之后的目的是：自检发生在日志通道可用的情况下。
+            #[cfg(target_os = "macos")]
+            if key_sync::startup_self_heal(app.handle()) == key_sync::StartupHeal::Relaunching {
+                app.handle().exit(0);
+                return Ok(());
+            }
             // 按键同步：按持久化开关启动引擎（macOS 缺权限时回退关闭并记 WARN）。
             // 必须在 mqtt::start 之前：回退修正过后的 config 决定是否订阅 keysync/<group>。
             let cfg = key_sync::startup_enable(app.handle(), cfg);
