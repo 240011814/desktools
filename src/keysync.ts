@@ -88,6 +88,8 @@ export function displayKey(key: string): string {
       return "Home";
     case "end":
       return "End";
+    case "enter":
+      return "Enter";
     default: {
       if (/^[a-z]$/.test(key) || /^f\d+$/.test(key)) return key.toUpperCase();
       return key;
@@ -133,9 +135,9 @@ export function withModifierToggled(combo: KeyCombo, mask: number): KeyCombo {
   };
 }
 
-/** 主键名归一化：仅支持字母 / 数字 / F1~F12 / 方向 / PageUp / PageDown / Home / End。
- * 接受常见别名（ArrowUp、Page Up、PgUp、PgDn、↓ 等），返回 camelCase 规范名；
- * 其余按键（Space / Enter / 标点等）不支持，返回 null。与 Rust normalize_key_name 一致。 */
+/** 主键名归一化：仅支持字母 / 数字 / F1~F12 / 方向 / PageUp / PageDown / Home / End / Enter。
+ * 接受常见别名（ArrowUp、Page Up、PgUp、PgDn、↓、Return、NumpadEnter 等），返回 camelCase 规范名；
+ * 其余按键（Space / 标点等）不支持，返回 null。与 Rust normalize_key_name 一致。 */
 export function normalizeKeyName(raw: string): string | null {
   const t = raw.trim();
   if (!t) return null;
@@ -144,6 +146,7 @@ export function normalizeKeyName(raw: string): string | null {
   if (t === "↓") return "down";
   if (t === "←") return "left";
   if (t === "→") return "right";
+  if (t === "⏎" || t === "↵") return "enter";
   const folded = t.replace(/ /g, "").toLowerCase();
   // 单字符：字母 / 数字
   if (folded.length === 1) {
@@ -157,7 +160,7 @@ export function normalizeKeyName(raw: string): string | null {
     const n = Number(num);
     return n === 0 || n > 12 || !Number.isSafeInteger(n) ? null : `f${n}`;
   }
-  // 方向 / 翻页 / Home / End
+  // 方向 / 翻页 / Home / End / Enter
   const stripped = folded.startsWith("arrow") ? folded.slice(5) : folded;
   switch (stripped) {
     case "up":
@@ -180,6 +183,10 @@ export function normalizeKeyName(raw: string): string | null {
       return "home";
     case "end":
       return "end";
+    case "enter":
+    case "return":
+    case "numpadenter":
+      return "enter";
     default:
       return null;
   }
@@ -261,7 +268,7 @@ export function parseComboText(input: string): KeyCombo | string {
       // 「Ctrl+」「Cmd+Shift+」这类未完成写法：别让用户误以为修饰键本身不合法
       return `组合缺少主键：「${main}」是修饰键，请再加一个主键（如 ${main}+F9 或 ${main}+↓）`;
     }
-    return `无法识别的主键「${main}」（支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）`;
+    return `无法识别的主键「${main}」（支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）`;
   }
   combo.key = key;
   return combo;
@@ -270,11 +277,11 @@ export function parseComboText(input: string): KeyCombo | string {
 /** 校验（结构化）组合：主键必须存在且已是规范化写法。返回 null = 合法 */
 export function comboError(combo: KeyCombo): string | null {
   if (!combo.key) {
-    return "组合缺少主键（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）";
+    return "组合缺少主键（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）";
   }
   const canonical = normalizeKeyName(combo.key);
   if (!canonical) {
-    return `主键「${combo.key}」不受支持（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）`;
+    return `主键「${combo.key}」不受支持（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）`;
   }
   if (canonical !== combo.key) {
     return `主键写法不规范，应为「${displayKey(canonical)}」`;

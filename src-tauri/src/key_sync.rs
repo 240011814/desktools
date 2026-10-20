@@ -21,6 +21,7 @@
 //!   不调用 CGRequest 弹安全面板；无权限时总开关回退关闭并在 UI 明确提示。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -170,6 +171,7 @@ pub fn display_key(key: &str) -> String {
         "pageDown" => "PageDown".into(),
         "home" => "Home".into(),
         "end" => "End".into(),
+        "enter" => "Enter".into(),
         other => {
             let bytes = other.as_bytes();
             if bytes.len() == 1 && bytes[0].is_ascii_lowercase()
@@ -184,20 +186,21 @@ pub fn display_key(key: &str) -> String {
     }
 }
 
-/// 主键名归一化：仅支持字母 / 数字 / F1~F12 / 方向 / PageUp / PageDown / Home / End。
-/// 接受常见别名（ArrowUp、Page Up、PgUp、↓ 等），返回 camelCase 规范名；
-/// 其余按键（Space / Enter / 标点等）不支持，返回 None。
+/// 主键名归一化：仅支持字母 / 数字 / F1~F12 / 方向 / PageUp / PageDown / Home / End / Enter。
+/// 接受常见别名（ArrowUp、Page Up、PgUp、↓、Return、NumpadEnter 等），返回 camelCase 规范名；
+/// 其余按键（Space / 标点等）不支持，返回 None。
 pub fn normalize_key_name(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    // 箭头写法（录制输入 / 手动输入容错）
+    // 箭头 / 回车写法（录制输入 / 手动输入容错）
     match raw {
         "↑" => return Some("up".into()),
         "↓" => return Some("down".into()),
         "←" => return Some("left".into()),
         "→" => return Some("right".into()),
+        "⏎" | "↵" => return Some("enter".into()),
         _ => {}
     }
     let folded = raw.replace(' ', "").to_ascii_lowercase();
@@ -218,7 +221,7 @@ pub fn normalize_key_name(raw: &str) -> Option<String> {
         }
         return None;
     }
-    // 方向 / 翻页 / Home / End（ArrowUp / PageUp / PgUp / Page Up 均可）
+    // 方向 / 翻页 / Home / End / Enter（ArrowUp / PageUp / PgUp / Page Up 均可）
     let stripped = folded.strip_prefix("arrow").unwrap_or(&folded);
     match stripped {
         "up" => Some("up".into()),
@@ -229,6 +232,7 @@ pub fn normalize_key_name(raw: &str) -> Option<String> {
         "pagedown" | "pgdown" | "pgdwn" | "pgdn" => Some("pageDown".into()),
         "home" => Some("home".into()),
         "end" => Some("end".into()),
+        "enter" | "return" | "numpadenter" => Some("enter".into()),
         _ => None,
     }
 }
@@ -275,7 +279,7 @@ pub fn parse_combo(input: &str) -> Result<KeyCombo, String> {
         Some(key) => combo.key = key,
         None => {
             return Err(format!(
-                "无法识别的主键「{main_raw}」（支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）"
+                "无法识别的主键「{main_raw}」（支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）"
             ));
         }
     }
@@ -286,7 +290,7 @@ pub fn parse_combo(input: &str) -> Result<KeyCombo, String> {
 pub fn combo_error(combo: &KeyCombo) -> Result<(), String> {
     if combo.key.is_empty() {
         return Err(
-            "组合缺少主键（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）"
+            "组合缺少主键（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）"
                 .into(),
         );
     }
@@ -297,7 +301,7 @@ pub fn combo_error(combo: &KeyCombo) -> Result<(), String> {
             display_key(&canonical)
         )),
         None => Err(format!(
-            "主键「{}」不受支持（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End）",
+            "主键「{}」不受支持（需为字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End / Enter）",
             combo.key
         )),
     }
@@ -451,6 +455,8 @@ pub struct KeySyncState {
     injected: Mutex<HashMap<String, i64>>,
     /// 最近一次「MQTT 未连接」提示时间（限频）
     offline_notice: Mutex<i64>,
+    /// 是否已提示过「辅助功能未授权」（注入权限预检误报时不刷屏）
+    post_warned: AtomicBool,
 }
 
 impl Default for KeySyncState {
@@ -459,6 +465,7 @@ impl Default for KeySyncState {
             published: Mutex::new(HashMap::new()),
             injected: Mutex::new(HashMap::new()),
             offline_notice: Mutex::new(0),
+            post_warned: AtomicBool::new(false),
         }
     }
 }
@@ -520,6 +527,12 @@ impl KeySyncState {
         }
         *last = now;
         true
+    }
+
+    /// 是否应记录一次「辅助功能（注入）权限未授予」提示：每个应用生命周期仅一次
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn take_post_permission_warning(&self) -> bool {
+        !self.post_warned.swap(true, Ordering::Relaxed)
     }
 }
 
@@ -720,6 +733,18 @@ fn inject_remote_combo(
     let state = app.state::<KeySyncState>();
     // 先标记抑制再注入：注入产生的本机按键事件不被钩子再次广播（防回环）
     state.mark_injected(&target.canonical());
+    // 注入权限（辅助功能）预检仅用于提示：预检可能误报，注入照常尝试
+    #[cfg(target_os = "macos")]
+    if macos_impl::post_access_ok() == Some(false) && state.take_post_permission_warning() {
+        logger::log(
+            app,
+            WARN,
+            format!(
+                "按键同步：{}（本次仍会尝试注入）",
+                macos_impl::post_permission_hint()
+            ),
+        );
+    }
     match inject_combo(target) {
         Ok(()) => logger::log(
             app,
@@ -979,7 +1004,7 @@ mod windows_impl {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
         VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR,
-        VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
+        VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, KBDLLHOOKSTRUCT, KF_REPEAT, LLKHF_INJECTED, MSG,
@@ -1017,6 +1042,7 @@ mod windows_impl {
             "pageDown" => VK_NEXT,
             "home" => VK_HOME,
             "end" => VK_END,
+            "enter" => VK_RETURN,
             _ => {
                 let bytes = name.as_bytes();
                 if bytes.len() == 1 {
@@ -1061,6 +1087,7 @@ mod windows_impl {
             VK_NEXT => Some("pageDown"),
             VK_HOME => Some("home"),
             VK_END => Some("end"),
+            VK_RETURN => Some("enter"),
             _ => None,
         }
     }
@@ -1396,13 +1423,20 @@ mod macos_impl {
         Ok(MAC_API.get().unwrap())
     }
 
-    /// 权限提示文本（预检失败 / tap 安装失败共用）
+    /// 监听权限提示（输入监控）：安装事件 tap 需要
     fn permission_hint() -> String {
-        "macOS 未授予「监听键盘事件」权限：请在 系统设置 → 隐私与安全性 → 输入监控（或辅助功能）中允许 desktools；若已授权仍不生效，重启应用后重新打开本开关".into()
+        "macOS 未授予「监听键盘事件」权限：请在 系统设置 → 隐私与安全性 → 输入监控 中勾选 desktools；若已勾选仍不生效，完全退出应用后重新打开，再开启本开关".into()
     }
 
-    /// 预检系统是否允许监听键盘事件 / 注入事件（以预检为准，不弹安全面板）。
+    /// 注入权限提示（辅助功能）：CGEventPost 投递按键需要；预检可能误报，不阻断注入
+    pub(super) fn post_permission_hint() -> String {
+        "macOS 系统报告未授予「模拟按键」权限（辅助功能）：注入仍会尝试；若目标应用无反应，请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选 desktools 并重启应用".into()
+    }
+
+    /// 预检系统是否允许监听键盘事件（以预检为准，不弹安全面板）。
     /// 预检 API 为 10.15+ 符号：更早系统缺失时忽略预检，交给实际安装结果兜底。
+    /// 注意：这里只检查监听权限；注入权限（辅助功能）在接收消息时按需提示，避免
+    /// 「只想接收、不发按键」的设备被误判为未授权。
     fn preflight() -> Result<(), String> {
         let api = api()?;
         if let Some(check) = api.preflight_listen
@@ -1410,12 +1444,14 @@ mod macos_impl {
         {
             return Err(permission_hint());
         }
-        if let Some(check) = api.preflight_post
-            && unsafe { !check() }
-        {
-            return Err(permission_hint());
-        }
         Ok(())
+    }
+
+    /// 注入权限预检（辅助功能，10.15+）：仅供提示，不阻断注入——
+    /// CGPreflightPostEventAccess 在部分环境会误报 false，而 CGEventPost 实际可投递
+    pub(super) fn post_access_ok() -> Option<bool> {
+        let api = api().ok()?;
+        api.preflight_post.map(|check| unsafe { check() })
     }
 
     /// macOS 虚拟键码（kVK_*，物理键位）
@@ -1477,6 +1513,7 @@ mod macos_impl {
             "pageDown" => 0x79,
             "home" => 0x73,
             "end" => 0x77,
+            "enter" => 0x24,
             _ => return None,
         })
     }
@@ -1536,6 +1573,8 @@ mod macos_impl {
             0x74 => "pageUp",
             0x77 => "end",
             0x79 => "pageDown",
+            0x24 => "enter",
+            0x4C => "enter",
             0x7B => "left",
             0x7C => "right",
             0x7D => "down",
@@ -1715,13 +1754,9 @@ mod macos_impl {
         let api = api()?;
         let keycode = keycode_for_key(&combo.key)
             .ok_or_else(|| format!("目标主键「{}」不受支持", combo.key))?;
-        // CGEventPost 无返回值，权限缺失时事件被系统静默丢弃：这里显式预检，
-        // 让单键 / 单向接收（未安装监听 tap → 未跑过启动预检）的场景得到明确提示
-        if let Some(check) = api.preflight_post
-            && unsafe { !check() }
-        {
-            return Err(permission_hint());
-        }
+        // 不在这里用 CGPreflightPostEventAccess 阻断注入：该预检在部分环境会误报
+        // （权限已授予仍返回 false），而实际 CGEventPost 可能正常投递。
+        // 权限缺失时由调用方记录一次 WARN 提示，注入始终尽力执行。
         let flags = mask_to_flags(combo.mask());
         unsafe {
             let down = (api.event_create)(std::ptr::null_mut(), keycode, true);
@@ -1804,6 +1839,10 @@ mod tests {
         assert_eq!(parse_combo("arrowdown").unwrap().key, "down");
         assert_eq!(parse_combo("Page Up").unwrap().key, "pageUp");
         assert_eq!(parse_combo("PgDn").unwrap().key, "pageDown");
+        assert_eq!(parse_combo("Enter").unwrap().key, "enter");
+        assert_eq!(parse_combo("Return").unwrap().key, "enter");
+        assert_eq!(parse_combo("numpadenter").unwrap().key, "enter");
+        assert_eq!(parse_combo("Ctrl+Enter").unwrap().canonical(), "ctrl+enter");
         assert!(parse_combo("ctrl+win+down").is_ok()); // Super 的别名 windows
     }
 
@@ -1828,6 +1867,7 @@ mod tests {
         assert_eq!(mac_combo.canonical(), "super+f9");
         assert_eq!(display_combo(&mac_combo, "macos"), "Cmd+F9");
         assert_eq!(display_combo(&mac_combo, "windows"), "Win+F9");
+        assert_eq!(display_combo(&combo("enter"), "macos"), "Enter");
         assert_eq!(
             display_combo(&parse_combo("alt+f1").unwrap(), "macos"),
             "Option+F1"

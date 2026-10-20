@@ -79,6 +79,10 @@ test("normalize: 常见别名归一为 camelCase 规范名", () => {
   assert.equal(normalizeKeyName("↓"), "down");
   assert.equal(normalizeKeyName("Home"), "home");
   assert.equal(normalizeKeyName("End"), "end");
+  assert.equal(normalizeKeyName("Enter"), "enter");
+  assert.equal(normalizeKeyName("Return"), "enter");
+  assert.equal(normalizeKeyName("NumpadEnter"), "enter");
+  assert.equal(normalizeKeyName("⏎"), "enter");
   assert.equal(normalizeKeyName("F9"), "f9");
   assert.equal(normalizeKeyName("f12"), "f12");
   assert.equal(normalizeKeyName("A"), "a");
@@ -89,7 +93,7 @@ test("normalize: F1~F12 之外的 F 键与非法键不支持", () => {
   assert.equal(normalizeKeyName("F13"), null);
   assert.equal(normalizeKeyName("f0"), null);
   assert.equal(normalizeKeyName("Space"), null);
-  assert.equal(normalizeKeyName("Enter"), null);
+  assert.equal(normalizeKeyName("Tab"), null);
   assert.equal(normalizeKeyName("é"), null);
   assert.equal(normalizeKeyName("f#9"), null);
   assert.equal(normalizeKeyName("  "), null);
@@ -145,14 +149,17 @@ test("display: 按平台显示（Rust display 对应）", () => {
   assert.equal(displayCombo(combo("alt+f1"), "macos"), "Option+F1");
   assert.equal(displayCombo(combo("alt+f1"), "windows"), "Alt+F1");
   assert.equal(displayCombo(combo("pgdn"), "windows"), "PageDown");
+  assert.equal(displayCombo(combo("enter"), "macos"), "Enter");
+  assert.equal(displayCombo(combo("Ctrl+Enter"), "windows"), "Ctrl+Enter");
 });
 
 /* ---------- 结构化组合校验 ---------- */
 
 test("comboError: 结构化组合的非法情况", () => {
   assert.match(comboError(emptyCombo())!, /组合缺少主键/);
-  assert.match(comboError({ ...emptyCombo(), key: "Enter" })!, /不受支持/);
+  assert.match(comboError({ ...emptyCombo(), key: "Tab" })!, /不受支持/);
   assert.match(comboError({ ...emptyCombo(), key: "PAGEUP" })!, /写法不规范/);
+  assert.equal(comboError(combo("Ctrl+Enter")), null);
   assert.equal(comboError(combo("Ctrl+Down")), null);
 });
 
@@ -223,6 +230,11 @@ test("comboFromEvent: 修饰键 + 主键", () => {
   assert.equal(comboFromEvent(fakeEvent("ArrowDown", { code: "ArrowDown", ctrlKey: true })), "ctrl+down");
   assert.equal(comboFromEvent(fakeEvent("a", { code: "KeyA", ctrlKey: true })), "ctrl+a");
   assert.equal(comboFromEvent(fakeEvent("F9", { code: "F9", altKey: true })), "alt+f9");
+  assert.equal(comboFromEvent(fakeEvent("Enter", { code: "Enter" })), "enter");
+  assert.equal(
+    comboFromEvent(fakeEvent("Enter", { code: "NumpadEnter", ctrlKey: true })),
+    "ctrl+enter",
+  );
   assert.equal(
     comboFromEvent(fakeEvent("ArrowDown", { code: "ArrowDown", ctrlKey: true, shiftKey: true })),
     "ctrl+shift+down",

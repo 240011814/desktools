@@ -346,9 +346,24 @@ function applyCombo(row: KeysyncRow, field: "source" | "target", combo: KeyCombo
  *  其余键（退格 / 方向键等）不拦截，留给手动编辑。Escape 取消恢复 */
 function comboKeydown(e: KeyboardEvent, row: KeysyncRow, field: "source" | "target") {
   if (e.key === "Enter") {
-    // 手动键入后回车 = 提交解析（与失焦一致）
-    e.preventDefault();
-    (e.target as HTMLInputElement).blur();
+    const text = (field === "source" ? row.sourceText : row.targetText).trim();
+    const base = text.endsWith("…") ? text.slice(0, -1) : text;
+    const hasModifier = e.ctrlKey || e.altKey || e.shiftKey || e.metaKey;
+    // 空输入框直接按 Enter = 录入单键 Enter；带修饰键时录入 Ctrl+Enter 等。
+    // 输入框已有内容且未按修饰键：保持「回车提交解析」的原有语义（与失焦一致）。
+    if (!hasModifier && base) {
+      e.preventDefault();
+      (e.target as HTMLInputElement).blur();
+      return;
+    }
+    const comboStr = comboFromEvent(e);
+    if (comboStr) {
+      const parsed = parseComboText(comboStr);
+      if (typeof parsed !== "string") {
+        e.preventDefault();
+        applyCombo(row, field, parsed);
+      }
+    }
     return;
   }
   if (e.key === "Escape") {
@@ -461,6 +476,7 @@ const QUICK_KEYS: Array<[string, string]> = [
   ["pageDown", "PgDn"],
   ["home", "Home"],
   ["end", "End"],
+  ["enter", "Enter"],
 ];
 
 /** 速选通用（非鼠标路径，如 F 键下拉）：沿用输入框里的修饰键前缀 / 已有组合的修饰键，
@@ -1031,148 +1047,152 @@ onMounted(() => {
 
       <div v-if="form.keySyncEnabled" class="keysync-rules">
         <div v-for="row in rows" :key="row.id" class="keysync-row" :class="{ off: !row.enabled }">
-          <label class="mini-switch" :title="row.enabled ? '停用该规则（组合保留）' : '启用该规则'">
-            <input
-              type="checkbox"
-              :checked="row.enabled"
-              :disabled="keySyncBusy"
-              @change="toggleRowEnabled(row)"
-            />
-            <span class="track"><span class="thumb"></span></span>
-          </label>
+          <div class="keysync-meta">
+            <label class="mini-switch" :title="row.enabled ? '停用该规则（组合保留）' : '启用该规则'">
+              <input
+                type="checkbox"
+                :checked="row.enabled"
+                :disabled="keySyncBusy"
+                @change="toggleRowEnabled(row)"
+              />
+              <span class="track"><span class="thumb"></span></span>
+            </label>
 
-          <div class="combo-cell">
             <input
-              v-model="row.sourceText"
-              class="combo-input"
-              :class="{ invalid: row.sourceError }"
+              v-model="row.note"
               type="text"
-              placeholder="按下组合录制，如 Ctrl+F9"
+              class="keysync-note"
+              placeholder="备注（可选）"
               spellcheck="false"
               autocomplete="off"
-              @keydown="comboKeydown($event, row, 'source')"
-              @keyup="comboKeyup($event, row, 'source')"
-              @blur="comboBlur(row, 'source')"
+              maxlength="30"
+              @input="scheduleKeySyncSave()"
             />
-            <div class="keysync-quick">
-              <button
-                v-for="[mask, label] in quickMods"
-                :key="mask"
-                type="button"
-                class="quick-key mod-key"
-                :class="{ active: (comboMask(comboModifierState(row, 'source')) & mask) !== 0 }"
-                :disabled="keySyncBusy"
-                :title="`叠加 / 取消 ${label}，再点下方主键`"
-                @mousedown.prevent
-                @contextmenu.prevent
-                @click="toggleQuickModifier(row, 'source', mask)"
-              >
-                {{ label }}
-              </button>
-              <span class="quick-divider" aria-hidden="true"></span>
-              <button
-                v-for="[value, label] in QUICK_KEYS"
-                :key="value"
-                type="button"
-                class="quick-key"
-                :disabled="keySyncBusy"
-                :title="`填入主键 ${label}（保留已选修饰键）`"
-                @mousedown.prevent="quickKeyMousedown($event, row, 'source', value)"
-                @contextmenu.prevent
-                @click="pickQuickKey($event, row, 'source', value)"
-              >
-                {{ label }}
-              </button>
-              <select
-                class="fkey-select"
-                :disabled="keySyncBusy"
-                title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
-                @change="pickFKey($event, row, 'source')"
-              >
-                <option value="" selected>F…</option>
-                <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
-              </select>
-            </div>
-            <p v-if="row.sourceError" class="row-err">{{ row.sourceError }}</p>
+
+            <select v-model="row.platform" :disabled="keySyncBusy" @change="scheduleKeySyncSave()">
+              <option value="all">全部平台</option>
+              <option value="windows">仅 Windows</option>
+              <option value="macos">仅 macOS</option>
+            </select>
+
+            <button class="ghost remove" type="button" :disabled="keySyncBusy" @click="removeRow(row)">
+              删除
+            </button>
           </div>
 
-          <span class="keysync-arrow" aria-hidden="true">→</span>
-
-          <div class="combo-cell">
-            <input
-              v-model="row.targetText"
-              class="combo-input"
-              :class="{ invalid: row.targetError }"
-              type="text"
-              placeholder="注入组合录制，如 Cmd+Down"
-              spellcheck="false"
-              autocomplete="off"
-              @keydown="comboKeydown($event, row, 'target')"
-              @keyup="comboKeyup($event, row, 'target')"
-              @blur="comboBlur(row, 'target')"
-            />
-            <div class="keysync-quick">
-              <button
-                v-for="[mask, label] in quickMods"
-                :key="mask"
-                type="button"
-                class="quick-key mod-key"
-                :class="{ active: (comboMask(comboModifierState(row, 'target')) & mask) !== 0 }"
-                :disabled="keySyncBusy"
-                :title="`叠加 / 取消 ${label}，再点下方主键`"
-                @mousedown.prevent
-                @contextmenu.prevent
-                @click="toggleQuickModifier(row, 'target', mask)"
-              >
-                {{ label }}
-              </button>
-              <span class="quick-divider" aria-hidden="true"></span>
-              <button
-                v-for="[value, label] in QUICK_KEYS"
-                :key="value"
-                type="button"
-                class="quick-key"
-                :disabled="keySyncBusy"
-                :title="`填入主键 ${label}（保留已选修饰键）`"
-                @mousedown.prevent="quickKeyMousedown($event, row, 'target', value)"
-                @contextmenu.prevent
-                @click="pickQuickKey($event, row, 'target', value)"
-              >
-                {{ label }}
-              </button>
-              <select
-                class="fkey-select"
-                :disabled="keySyncBusy"
-                title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
-                @change="pickFKey($event, row, 'target')"
-              >
-                <option value="" selected>F…</option>
-                <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
-              </select>
+          <div class="keysync-combos">
+            <div class="combo-cell">
+              <input
+                v-model="row.sourceText"
+                class="combo-input"
+                :class="{ invalid: row.sourceError }"
+                type="text"
+                placeholder="源组合：按下录制，如 Ctrl+F9"
+                spellcheck="false"
+                autocomplete="off"
+                @keydown="comboKeydown($event, row, 'source')"
+                @keyup="comboKeyup($event, row, 'source')"
+                @blur="comboBlur(row, 'source')"
+              />
+              <div class="keysync-quick">
+                <button
+                  v-for="[mask, label] in quickMods"
+                  :key="mask"
+                  type="button"
+                  class="quick-key mod-key"
+                  :class="{ active: (comboMask(comboModifierState(row, 'source')) & mask) !== 0 }"
+                  :disabled="keySyncBusy"
+                  :title="`叠加 / 取消 ${label}，再点下方主键`"
+                  @mousedown.prevent
+                  @contextmenu.prevent
+                  @click="toggleQuickModifier(row, 'source', mask)"
+                >
+                  {{ label }}
+                </button>
+                <span class="quick-divider" aria-hidden="true"></span>
+                <button
+                  v-for="[value, label] in QUICK_KEYS"
+                  :key="value"
+                  type="button"
+                  class="quick-key"
+                  :disabled="keySyncBusy"
+                  :title="`填入主键 ${label}（保留已选修饰键）`"
+                  @mousedown.prevent="quickKeyMousedown($event, row, 'source', value)"
+                  @contextmenu.prevent
+                  @click="pickQuickKey($event, row, 'source', value)"
+                >
+                  {{ label }}
+                </button>
+                <select
+                  class="fkey-select"
+                  :disabled="keySyncBusy"
+                  title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
+                  @change="pickFKey($event, row, 'source')"
+                >
+                  <option value="" selected>F…</option>
+                  <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
+                </select>
+              </div>
+              <p v-if="row.sourceError" class="row-err">{{ row.sourceError }}</p>
             </div>
-            <p v-if="row.targetError" class="row-err">{{ row.targetError }}</p>
+
+            <span class="keysync-arrow" aria-hidden="true">→</span>
+
+            <div class="combo-cell">
+              <input
+                v-model="row.targetText"
+                class="combo-input"
+                :class="{ invalid: row.targetError }"
+                type="text"
+                placeholder="目标组合：按下录制或点选，如 F9"
+                spellcheck="false"
+                autocomplete="off"
+                @keydown="comboKeydown($event, row, 'target')"
+                @keyup="comboKeyup($event, row, 'target')"
+                @blur="comboBlur(row, 'target')"
+              />
+              <div class="keysync-quick">
+                <button
+                  v-for="[mask, label] in quickMods"
+                  :key="mask"
+                  type="button"
+                  class="quick-key mod-key"
+                  :class="{ active: (comboMask(comboModifierState(row, 'target')) & mask) !== 0 }"
+                  :disabled="keySyncBusy"
+                  :title="`叠加 / 取消 ${label}，再点下方主键`"
+                  @mousedown.prevent
+                  @contextmenu.prevent
+                  @click="toggleQuickModifier(row, 'target', mask)"
+                >
+                  {{ label }}
+                </button>
+                <span class="quick-divider" aria-hidden="true"></span>
+                <button
+                  v-for="[value, label] in QUICK_KEYS"
+                  :key="value"
+                  type="button"
+                  class="quick-key"
+                  :disabled="keySyncBusy"
+                  :title="`填入主键 ${label}（保留已选修饰键）`"
+                  @mousedown.prevent="quickKeyMousedown($event, row, 'target', value)"
+                  @contextmenu.prevent
+                  @click="pickQuickKey($event, row, 'target', value)"
+                >
+                  {{ label }}
+                </button>
+                <select
+                  class="fkey-select"
+                  :disabled="keySyncBusy"
+                  title="F1~F12（保留已选修饰键；macOS 顶排 F 键被媒体键接管时用这里选）"
+                  @change="pickFKey($event, row, 'target')"
+                >
+                  <option value="" selected>F…</option>
+                  <option v-for="n in 12" :key="n" :value="`f${n}`">F{{ n }}</option>
+                </select>
+              </div>
+              <p v-if="row.targetError" class="row-err">{{ row.targetError }}</p>
+            </div>
           </div>
-
-          <select v-model="row.platform" :disabled="keySyncBusy" @change="scheduleKeySyncSave()">
-            <option value="all">全部平台</option>
-            <option value="windows">仅 Windows</option>
-            <option value="macos">仅 macOS</option>
-          </select>
-
-          <input
-            v-model="row.note"
-            type="text"
-            class="keysync-note"
-            placeholder="备注"
-            spellcheck="false"
-            autocomplete="off"
-            maxlength="30"
-            @input="scheduleKeySyncSave()"
-          />
-
-          <button class="ghost remove" type="button" :disabled="keySyncBusy" @click="removeRow(row)">
-            删除
-          </button>
         </div>
 
         <div class="keysync-foot">
@@ -1184,22 +1204,6 @@ onMounted(() => {
 
       <p v-if="keySyncError" class="hint err">{{ keySyncError }}</p>
       <p v-else-if="keySyncSaved" class="hint ok">按键同步设置已保存</p>
-      <p v-else class="hint">
-        只在发送端配置就能单向生效：本机按下「源组合」即广播
-        源组合 + 目标组合 + 目标平台，接收端<b>没有同源规则时按发送端映射注入</b>；
-        接收端若也配置了同源规则（启用中），则以<b>本机规则</b>为准——每台设备可映射到
-        不同按键。目标平台选「全部」时，同组里未单独配置规则的所有设备都会执行注入。
-        目标组合也支持<strong>单键</strong>（如仅 F9 / 仅 ↓，点下方主键按钮直接填入）。
-        组合框支持按下录制与手动键入键名（回车或失焦提交）；<b>方向键 ↑↓←→、Home、End
-        等系统易占用的组合：先点输入框下方的 Ctrl / Option / Shift / Cmd 再点 ↑↓←→</b>
-        （修饰键按钮会高亮，可叠加；也可按住修饰键直接点主键）。<b>F 键</b>用速选栏末尾的
-        「F…」下拉选择（F1~F12），也可直接键入「f9」。macOS 说明：Ctrl+↑↓ /
-        Ctrl+←→ / Ctrl+Space 等被系统快捷键（调度中心 / 切换空间 / 输入法）优先处理，直接按键
-        录不到——请用上述速选按钮或键名输入，或到「系统设置 → 键盘 → 键盘快捷键」临时停用
-        对应项后录制；顶排 F 键默认是媒体键（按 F9 不产生 F9），请用「F…」下拉 / 键入 `f9`
-        或按住 Fn 再按；安装引擎需允许键盘事件监听（系统设置 → 隐私与安全性 → 输入监视，
-        勾选 desktools 后重新打开总开关）。
-      </p>
     </section>
 
     <!-- 启动 -->
@@ -1298,10 +1302,30 @@ onMounted(() => {
 }
 
 .keysync-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.keysync-row + .keysync-row {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* 规则标题行：启用开关 / 备注 / 平台 / 删除 */
+.keysync-meta {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) 108px minmax(96px, 140px) auto;
+  grid-template-columns: auto minmax(0, 1fr) 108px auto;
   gap: 8px;
   align-items: center;
+}
+
+/* 组合行：源组合 → 目标组合（输入框 + 速选按钮独占整行宽度） */
+.keysync-combos {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
 }
 
 .keysync-row.off {
@@ -1352,7 +1376,7 @@ onMounted(() => {
 
 .keysync-arrow {
   color: var(--text-secondary);
-  padding: 0 1px;
+  padding: 8px 1px 0;
 }
 
 .row-err {
@@ -1367,15 +1391,22 @@ onMounted(() => {
 
 /* 主键速选（方向键等系统快捷键易占用 / 单键映射的主键快速填入） */
 .keysync-quick {
-  display: flex;
+  display: none;
   flex-wrap: wrap;
   gap: 4px;
 }
 
+/* 速选区只在对应组合输入框（或其间控件）获得焦点时展开，避免规则常驻过高 */
+.combo-cell:focus-within .keysync-quick {
+  display: flex;
+}
+
 .quick-key {
+  min-width: 32px;
   padding: 1px 8px;
   font-size: 0.72rem;
   line-height: 1.5;
+  text-align: center;
   border-radius: 7px;
 }
 
@@ -1392,15 +1423,16 @@ onMounted(() => {
 }
 
 .quick-divider {
-  width: 1px;
-  align-self: stretch;
-  margin: 1px 2px;
-  background: var(--border);
+  flex: 0 0 100%;
+  height: 0;
+  margin: 1px 0;
+  border-top: 1px dashed var(--border);
 }
 
 /* F 键下拉（样式做成速选按钮的模样，避免整行 select 尺寸） */
 .keysync-row select.fkey-select {
   width: auto;
+  min-width: 44px;
   height: auto;
   padding: 1px 4px;
   font-size: 0.72rem;
