@@ -21,6 +21,10 @@
 //!   不调用 CGRequest 弹安全面板；无权限时总开关回退关闭并在 UI 明确提示。
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -1030,6 +1034,185 @@ pub fn key_sync_permissions() -> KeySyncPermissions {
             post: None,
         }
     }
+}
+
+/* ---------------- 启动自检：macOS「模拟按键」权限自修复 ---------------- */
+
+/// 启动自检对调用方的期望
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupHeal {
+    /// 已授权（或已请求授权），正常继续启动
+    Ok,
+    /// 本进程应立即退出，由自修复流程重新签名后重新启动
+    Relaunching,
+}
+
+/// 与 tauri.conf.json `bundle.macOS.signingIdentity` 一致的稳定签名身份
+#[cfg(target_os = "macos")]
+const STABLE_SIGNING_IDENTITY: &str = "desktools-dev";
+
+/// 启动时自动检查 macOS 辅助功能（模拟按键）权限：
+/// - 已授权：直接跳过，不打扰用户。
+/// - 未授权且签名异常（如被 GitHub release 的 ad-hoc 更新包覆盖）：
+///   本机 keychain 若有稳定证书，就自动重签重启，重启后 TCC 记录会重新匹配，无需再授权。
+/// - 未授权且签名正常 / 无法重签：主动弹出系统授权面板。
+#[cfg(target_os = "macos")]
+pub fn startup_self_heal(app: &AppHandle) -> StartupHeal {
+    // 仅在「明确返回 false」时动作；预检 API 缺失（None）或误报时保持现状
+    if macos_impl::post_access_ok() != Some(false) {
+        return StartupHeal::Ok;
+    }
+
+    let Some(bundle) = installed_app_bundle() else {
+        // 开发构建 / 非标准安装位置：请求授权即可
+        macos_impl::request_post_access();
+        return StartupHeal::Ok;
+    };
+
+    if is_signed_with_stable_identity(&bundle) {
+        // 签名正常但仍未授权：首次安装或开关被动手动调整，主动请求授权
+        macos_impl::request_post_access();
+        return StartupHeal::Ok;
+    }
+
+    if !keychain_has_stable_identity() {
+        logger::log(
+            app,
+            WARN,
+            "按键同步权限未生效，且本机未导入稳定签名证书（desktools-dev）：跳过自动重签，已弹出系统授权面板",
+        );
+        macos_impl::request_post_access();
+        return StartupHeal::Ok;
+    }
+
+    logger::log(
+        app,
+        WARN,
+        "按键同步权限未生效，且安装包签名异常：自动以 desktools-dev 重新签名并重启应用（重启后若之前授权过该身份，无需再确认）",
+    );
+    spawn_repair_and_relaunch(&bundle);
+    StartupHeal::Relaunching
+}
+
+/// 仅对 /Applications 下的 .app 安装形式识别 bundle 路径；开发/调试构建返回 None
+#[cfg(target_os = "macos")]
+fn installed_app_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    detect_app_bundle_from_exe(&exe)
+}
+
+/// 给定可执行路径，返回所属 .app bundle（dev/debug 等目标路径返回 None）
+#[cfg(target_os = "macos")]
+fn detect_app_bundle_from_exe(exe: &Path) -> Option<PathBuf> {
+    // /Applications/<name>.app/Contents/MacOS/<name>
+    if !exe.starts_with("/Applications/") {
+        return None;
+    }
+    let macos = exe.parent()?;
+    if macos.file_name().and_then(|name| name.to_str()) != Some("MacOS") {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name().and_then(|name| name.to_str()) != Some("Contents") {
+        return None;
+    }
+    let bundle = contents.parent()?;
+    if bundle
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("app"))
+        != Some(true)
+    {
+        return None;
+    }
+    Some(bundle.to_path_buf())
+}
+
+/// 当前安装包是否由稳定身份（desktools-dev）签名
+#[cfg(target_os = "macos")]
+fn is_signed_with_stable_identity(bundle: &Path) -> bool {
+    Command::new("codesign")
+        .arg("-dv")
+        .arg("--verbose=4")
+        .arg(bundle)
+        .output()
+        .map(|out| {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            signed_authority_matches(&text)
+        })
+        .unwrap_or(false)
+}
+
+/// 判断 `codesign -dv` 输出中是否包含稳定身份的 Authority 行
+#[cfg(target_os = "macos")]
+fn signed_authority_matches(codesign_output: &str) -> bool {
+    codesign_output.lines().any(|line| {
+        line.trim()
+            .starts_with(&format!("Authority={STABLE_SIGNING_IDENTITY}"))
+    })
+}
+
+/// 本机 keychain 是否具备可用的稳定签名身份
+#[cfg(target_os = "macos")]
+fn keychain_has_stable_identity() -> bool {
+    Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .map(|out| {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            identity_list_contains_stable(&text)
+        })
+        .unwrap_or(false)
+}
+
+/// 判断 `security find-identity -v -p codesigning` 输出中是否包含稳定身份
+#[cfg(target_os = "macos")]
+fn identity_list_contains_stable(identity_list: &str) -> bool {
+    identity_list.contains(STABLE_SIGNING_IDENTITY)
+}
+
+/// 以稳定身份重签安装包并重新启动：抢占进程退出后执行的分离脚本
+#[cfg(target_os = "macos")]
+fn spawn_repair_and_relaunch(bundle: &Path) {
+    let bundle_arg = shell_quoted(bundle);
+    let log_file = shell_quoted(&std::env::temp_dir().join("desktools-selfheal.log"));
+    let script = format!(
+        "sleep 1.5 && codesign --force --deep --sign {STABLE_SIGNING_IDENTITY} {bundle_arg} >> {log_file} 2>&1 && open {bundle_arg}",
+    );
+    // 用分离子进程执行：主进程退出后脚本仍继续跑，完成重签与重启
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// 简单 shell 引号包裹（路径不含单引号，正常情况足够）
+#[cfg(target_os = "macos")]
+fn shell_quoted(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /* ---------------- Windows：WH_KEYBOARD_LL 钩子 + SendInput 注入 ---------------- */
@@ -2060,6 +2243,61 @@ fn macos_stop() {
 #[cfg(target_os = "macos")]
 fn macos_inject_combo(combo: &KeyCombo) -> Result<(), String> {
     macos_impl::inject(combo)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod self_heal_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn detects_installed_app_bundle() {
+        let exe = Path::new("/Applications/desktools.app/Contents/MacOS/desktools");
+        assert_eq!(
+            detect_app_bundle_from_exe(exe).as_deref(),
+            Some(Path::new("/Applications/desktools.app"))
+        );
+    }
+
+    #[test]
+    fn ignores_non_installed_locations() {
+        // dev / debug 构建不在 /Applications 下
+        assert_eq!(
+            detect_app_bundle_from_exe(Path::new(
+                "/Users/hyy/project/desktools/src-tauri/target/release/desktools"
+            )),
+            None
+        );
+        // .app 目录缺失
+        assert_eq!(
+            detect_app_bundle_from_exe(Path::new("/Applications/foo/Contents/MacOS/foo")),
+            None
+        );
+        // 不是从*.app 里的可执行
+        assert_eq!(
+            detect_app_bundle_from_exe(Path::new(
+                "/Applications/other.app/Contents/Resources/helper"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn stable_identity_matches_authority_line() {
+        assert!(signed_authority_matches("Authority=desktools-dev"));
+        assert!(!signed_authority_matches("Signature=adhoc"));
+        assert!(!signed_authority_matches("Authority=other-dev"));
+    }
+
+    #[test]
+    fn identity_list_matches_stable_identity() {
+        assert!(identity_list_contains_stable(
+            "1) 89EA8DD1763109B974A2B31118D6FA9DAB0EDD32 \"desktools-dev\"\n"
+        ));
+        assert!(!identity_list_contains_stable(
+            "  2) EFCDE... \"some-other-identity\"\n"
+        ));
+    }
 }
 
 #[cfg(test)]
