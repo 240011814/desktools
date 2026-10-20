@@ -9,6 +9,7 @@ mod config;
 mod file_hub;
 mod fs_atomic;
 mod history;
+mod key_sync;
 mod lock_sync;
 mod logger;
 mod mqtt;
@@ -19,6 +20,15 @@ use config::{MinioConfig, MqttConfig};
 use history::{HistoryItem, HistoryState};
 use logger::{LogEntry, LogState};
 use mqtt::{MqttStatus, SyncState};
+
+/// `set_key_sync` 的返回：保存后的配置 + 警告（部分成功场景，如 macOS 缺权限回退关闭）
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KeySyncSaveResult {
+    config: MqttConfig,
+    /// 非空时前端弹 toast（例：macOS 缺监听权限，总开关已回退关闭）
+    warning: String,
+}
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -74,12 +84,15 @@ fn save_mqtt_config(app: tauri::AppHandle, mut cfg: MqttConfig) -> Result<MqttCo
     cfg.group = cfg.group.trim().to_string();
     cfg.username = cfg.username.trim().to_string();
     // 开机自启由 set_autostart、MinIO 由 save_minio_config 各自专管：
-    // 整份表单保存时保留已持久化值，避免被前端旧值覆盖
+    // 整份表单保存时保留已持久化值，避免被前端旧值覆盖。
+    // 按键同理：其规则与开关专由 set_key_sync 维护，不随整份表单覆写。
     {
         let state = app.state::<SyncState>();
         let persisted = state.config.lock().unwrap().clone();
         cfg.auto_start = persisted.auto_start;
         cfg.minio = persisted.minio;
+        cfg.key_sync_enabled = persisted.key_sync_enabled;
+        cfg.key_sync_rules = persisted.key_sync_rules;
     }
     cfg.validate()?;
 
@@ -195,6 +208,68 @@ fn set_lock_sync(
             validate_switch_off
         },
     )
+}
+
+/// 保存「按键同步」配置（窄接口：只改 keySync 开关与规则，不触碰设置页其他未提交字段）。
+///
+/// 流程：校验 → 先启停引擎（启用失败不落盘，避免「开关亮着却不工作」）→ 保存 → 仅在
+/// 总开关变化时重连 MQTT（keysync 订阅只与开关有关；编辑规则不打断剪贴板同步）。
+#[tauri::command]
+fn set_key_sync(
+    app: tauri::AppHandle,
+    enabled: bool,
+    rules: Vec<key_sync::KeySyncRule>,
+) -> Result<KeySyncSaveResult, String> {
+    let mut cfg = {
+        let state = app.state::<SyncState>();
+        let mut cfg = state.config.lock().unwrap().clone();
+        cfg.key_sync_enabled = enabled;
+        cfg.key_sync_rules = rules;
+        cfg
+    };
+    let was_enabled = app
+        .state::<SyncState>()
+        .config
+        .lock()
+        .unwrap()
+        .key_sync_enabled;
+    key_sync::validate_rules(&cfg.key_sync_rules)?;
+    if enabled {
+        validate_switch_on(&cfg)?;
+    } else {
+        validate_switch_off(&cfg)?;
+    }
+
+    // 先启停引擎：macOS 缺监听权限时总开关回退关闭（规则仍然保存），由前端弹提示
+    let mut warning = String::new();
+    match key_sync::start_engine(&app, &cfg) {
+        Ok(_) => {}
+        Err(key_sync::EngineError::Permission(message)) => {
+            cfg.key_sync_enabled = false;
+            warning = message;
+        }
+        Err(key_sync::EngineError::Failed(message)) => {
+            key_sync::stop_engine();
+            return Err(message);
+        }
+    }
+
+    cfg.save(&config::config_path(&app))?;
+    {
+        let state = app.state::<SyncState>();
+        *state.config.lock().unwrap() = cfg.clone();
+    }
+    if was_enabled != cfg.key_sync_enabled {
+        // 重连：开启时订阅 keysync/<group>，关闭时旧订阅随重连断开
+        mqtt::start(app.clone(), cfg.clone());
+    }
+    if !warning.is_empty() {
+        logger::log(&app, logger::WARN, format!("按键同步：{warning}"));
+    }
+    Ok(KeySyncSaveResult {
+        config: cfg,
+        warning,
+    })
 }
 
 #[tauri::command]
@@ -527,6 +602,7 @@ pub fn run() {
             save_mqtt_config,
             set_auto_lock,
             set_lock_sync,
+            set_key_sync,
             get_history,
             delete_history,
             clear_history,
@@ -597,12 +673,16 @@ pub fn run() {
             app.manage(HistoryState::load(config::history_path(app.handle())));
             app.manage(auto_lock::AutoLockState::default());
             app.manage(lock_sync::LockSyncState::default());
+            app.manage(key_sync::KeySyncState::default());
             let log_path = app
                 .path()
                 .app_log_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."))
                 .join("desktools.jsonl");
             app.manage(LogState::load(log_path));
+            // 按键同步：按持久化开关启动引擎（macOS 缺权限时回退关闭并记 WARN）。
+            // 必须在 mqtt::start 之前：回退修正过后的 config 决定是否订阅 keysync/<group>。
+            let cfg = key_sync::startup_enable(app.handle(), cfg);
             logger::log(
                 app.handle(),
                 logger::INFO,

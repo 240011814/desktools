@@ -1,8 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { platform } from "@tauri-apps/plugin-os";
-import { mqttStatus, type MqttConfig, type MinioConfig } from "../store";
+import { mqttStatus, type KeyCombo, type KeySyncRule, type MqttConfig, type MinioConfig } from "../store";
+import {
+  comboFromEvent,
+  displayCombo,
+  emptyCombo,
+  isModifierOnlyKey,
+  parseComboText,
+  previewCombo,
+  validateRule,
+} from "../keysync";
+import { useToast } from "../toast";
 
 /* ---------------- 开机自启 ---------------- */
 interface AutostartState {
@@ -61,6 +71,9 @@ const form = reactive<MqttConfig>({
   lockSyncPublish: false,
   lockSyncFollow: false,
   lockSyncIdleGuardSecs: 300,
+  // 按键同步
+  keySyncEnabled: false,
+  keySyncRules: [],
   autoStart: true,
   minio: { host: "", port: 9000, bucket: "hub", tls: false, accessKey: "", secretKey: "" },
 });
@@ -77,6 +90,7 @@ async function loadConfig() {
   try {
     const cfg = await invoke<MqttConfig>("get_mqtt_config");
     Object.assign(form, cfg);
+    rows.value = buildRows(cfg.keySyncRules ?? []);
   } catch {
     /* 浏览器预览等无 Tauri 环境时使用默认值 */
   }
@@ -221,6 +235,258 @@ async function toggleFollow() {
   if (lockSyncBusy.value) return;
   await saveLockSyncFlag(form.lockSyncPublish, !form.lockSyncFollow);
 }
+
+/* ---------------- 按键同步（窄接口 set_key_sync；规则 CRUD + 5s 防抖自动保存） ---------------- */
+/* 文本框是「展示 / 录制」视图；真正保存的是最近一次解析成功的结构化组合：
+   行内解析失败时保留旧组合并显示行错误，禁用的规则允许保留非法组合（与后端 validate_rules 一致） */
+const keysyncToast = useToast();
+
+interface KeysyncRow {
+  id: string;
+  enabled: boolean;
+  sourceText: string;
+  targetText: string;
+  platform: string;
+  note: string;
+  sourceCombo: KeyCombo;
+  targetCombo: KeyCombo;
+  sourceError: string;
+  targetError: string;
+}
+
+const rows = ref<KeysyncRow[]>([]);
+const rowsDirty = ref(false);
+const keySyncBusy = ref(false);
+const keySyncError = ref("");
+const keySyncSaved = ref(false);
+let keySyncSaveTimer: number | undefined;
+
+const keySyncTopic = computed(() => `keysync/${form.group.trim() || "<group号>"}`);
+
+/** 按当前平台美化组合显示（Windows 用 Win，macOS 用 Cmd/Option） */
+function comboText(combo: KeyCombo): string {
+  return combo.key ? displayCombo(combo, osName) : "";
+}
+
+function buildRows(rules: KeySyncRule[]): KeysyncRow[] {
+  return rules.map((rule) => ({
+    id: rule.id || newUuid(),
+    enabled: rule.enabled,
+    sourceText: comboText(rule.source),
+    targetText: comboText(rule.target),
+    platform: rule.platform || "all",
+    note: rule.note,
+    sourceCombo: { ...rule.source },
+    targetCombo: { ...rule.target },
+    sourceError: "",
+    targetError: "",
+  }));
+}
+
+function newUuid(): string {
+  return typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `rule-${Date.now()}-${Math.random()}`;
+}
+
+function scheduleKeySyncSave() {
+  rowsDirty.value = true;
+  clearTimeout(keySyncSaveTimer);
+  // 5s 防抖自动保存：连续编辑不打断输入；失败不自动重试（保持 UI + toast）
+  keySyncSaveTimer = window.setTimeout(() => void saveKeySync(), 5000);
+}
+
+/** 把行文本解析进结构化组合；失败时保留旧组合并返回 false */
+function parseRowField(row: KeysyncRow, field: "source" | "target"): boolean {
+  const text = (field === "source" ? row.sourceText : row.targetText).trim();
+  const err = field === "source" ? "sourceError" : "targetError";
+  if (text === "") {
+    // 未填写：保留旧结构化组合，清掉错误提示
+    row[err] = "";
+    return true;
+  }
+  const parsed = parseComboText(text);
+  if (typeof parsed === "string") {
+    row[err] = parsed;
+    return false;
+  }
+  row[field === "source" ? "sourceCombo" : "targetCombo"] = parsed;
+  row[err] = "";
+  return true;
+}
+
+function restoreComboText(row: KeysyncRow, field: "source" | "target") {
+  if (field === "source") row.sourceText = comboText(row.sourceCombo);
+  else row.targetText = comboText(row.targetCombo);
+}
+
+/** 录制 / 解析成功后提交组合并触发防抖保存 */
+function applyCombo(row: KeysyncRow, field: "source" | "target", combo: KeyCombo) {
+  const slot = field === "source" ? "sourceCombo" : "targetCombo";
+  const text = field === "source" ? "sourceText" : "targetText";
+  const err = field === "source" ? "sourceError" : "targetError";
+  if (JSON.stringify(row[slot]) !== JSON.stringify(combo)) {
+    row[slot] = combo;
+    row[text] = comboText(combo);
+    scheduleKeySyncSave();
+  } else {
+    row[text] = comboText(combo); // 内容没变也要把预览残留换回来
+  }
+  row[err] = "";
+}
+
+/** keydown 录制：识别出的组合立即提交；修饰键单独按下时先显示预览；
+ *  其余键（退格 / 方向键等）不拦截，留给手动编辑。Escape 取消恢复 */
+function comboKeydown(e: KeyboardEvent, row: KeysyncRow, field: "source" | "target") {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    restoreComboText(row, field);
+    if (field === "source") row.sourceError = "";
+    else row.targetError = "";
+    return;
+  }
+  const comboStr = comboFromEvent(e);
+  if (comboStr) {
+    // 仅修饰键（尚未构成组合）不提交；此处 comboStr 非空意味着已有主键
+    const parsed = parseComboText(comboStr);
+    if (typeof parsed !== "string") {
+      // 无修饰键时只对 F 键直接录制（字母 / 方向键留给手动编辑，避免打字被吞）
+      const isBareCombo = !parsed.ctrl && !parsed.alt && !parsed.shift && !parsed.meta;
+      if (isBareCombo && !/^f\d+$/.test(parsed.key)) return; // 不拦截：交给手动编辑
+      e.preventDefault();
+      applyCombo(row, field, parsed);
+    }
+    return;
+  }
+  if (isModifierOnlyKey(e)) {
+    e.preventDefault();
+    const preview = previewCombo(e, osName);
+    if (preview) {
+      if (field === "source") row.sourceText = preview;
+      else row.targetText = preview;
+    }
+  }
+}
+
+/** 修饰键松开且没按主键 → 恢复已设定组合的展示（预览残留清理） */
+function comboKeyup(e: KeyboardEvent, row: KeysyncRow, field: "source" | "target") {
+  if (!isModifierOnlyKey(e)) return;
+  const text = (field === "source" ? row.sourceText : row.targetText).trim();
+  if (text.endsWith("…")) restoreComboText(row, field);
+}
+
+/** 失焦：把当前文本解析提交；解析失败恢复旧组合展示 + 保留行错误 */
+function comboBlur(row: KeysyncRow, field: "source" | "target") {
+  const text = (field === "source" ? row.sourceText : row.targetText).trim();
+  if (text.endsWith("…")) {
+    restoreComboText(row, field);
+    return;
+  }
+  if (text === "") {
+    if (field === "source") row.sourceError = "";
+    else row.targetError = "";
+    return;
+  }
+  if (!parseRowField(row, field)) {
+    restoreComboText(row, field); // 旧组合保留（行错误已标记原因）
+    scheduleKeySyncSave();
+  } else {
+    // 解析成功但写法可能不规范（如 PgUp → PageUp），统一成规范展示
+    const combo = field === "source" ? row.sourceCombo : row.targetCombo;
+    const slot = field === "source" ? "sourceText" : "targetText";
+    if (row[slot] !== comboText(combo)) {
+      row[slot] = comboText(combo);
+      scheduleKeySyncSave();
+    }
+  }
+}
+
+function addRow() {
+  rows.value.push({
+    id: newUuid(),
+    enabled: true,
+    sourceText: "",
+    targetText: "",
+    platform: "all",
+    note: "",
+    sourceCombo: { ...emptyCombo() },
+    targetCombo: { ...emptyCombo() },
+    sourceError: "",
+    targetError: "",
+  });
+  scheduleKeySyncSave();
+}
+
+function removeRow(row: KeysyncRow) {
+  rows.value = rows.value.filter((item) => item.id !== row.id);
+  scheduleKeySyncSave();
+}
+
+/** 单条规则开关（禁用的规则不参与匹配，组合可保留非法写法） */
+function toggleRowEnabled(row: KeysyncRow) {
+  row.enabled = !row.enabled;
+  scheduleKeySyncSave();
+}
+
+async function saveKeySync() {
+  if (keySyncBusy.value) return;
+  clearTimeout(keySyncSaveTimer);
+  keySyncBusy.value = true;
+  keySyncError.value = "";
+  keySyncSaved.value = false;
+  try {
+    rows.value.forEach((row) => {
+      parseRowField(row, "source");
+      parseRowField(row, "target");
+    });
+    const rules: KeySyncRule[] = rows.value.map((row) => ({
+      id: row.id,
+      enabled: row.enabled,
+      source: { ...row.sourceCombo },
+      target: { ...row.targetCombo },
+      platform: row.platform,
+      note: row.note,
+    }));
+    for (let index = 0; index < rules.length; index++) {
+      const err = validateRule(rules[index]!, index);
+      if (err) {
+        keySyncError.value = err;
+        keysyncToast.showToast(err);
+        rowsDirty.value = true;
+        return;
+      }
+    }
+    const result = await invoke<{ config: MqttConfig; warning: string }>("set_key_sync", {
+      enabled: form.keySyncEnabled,
+      rules,
+    });
+    Object.assign(form, result.config);
+    rows.value = buildRows(result.config.keySyncRules ?? []);
+    rowsDirty.value = false;
+    keySyncSaved.value = true;
+    setTimeout(() => (keySyncSaved.value = false), 4000);
+    // macOS 缺权限等部分成功场景：后端已回退开关，前端弹提示
+    if (result.warning) keysyncToast.showToast(result.warning);
+  } catch (e) {
+    keySyncError.value = String(e);
+    keysyncToast.showToast(String(e));
+    // 保存失败回读持久化配置，行视图与实际状态对齐（不自动重试，避免错误循环）
+    await loadConfig();
+    rowsDirty.value = false;
+  } finally {
+    keySyncBusy.value = false;
+  }
+}
+
+async function toggleKeySync() {
+  if (keySyncBusy.value) return;
+  form.keySyncEnabled = !form.keySyncEnabled;
+  await saveKeySync();
+}
+
+onUnmounted(() => {
+  clearTimeout(keySyncSaveTimer);
+  // 切换页面时若还有未保存改动，立即落一次（失败静默，配置仍在）
+  if (rowsDirty.value && !keySyncBusy.value) void saveKeySync();
+});
 
 /* ---------------- 桌面右键菜单集成 ---------------- */
 interface IntegrationStatus {
@@ -598,6 +864,113 @@ onMounted(() => {
       </p>
     </section>
 
+    <!-- 按键同步 -->
+    <section class="card">
+      <div class="card-head">
+        <div>
+          <h2>按键同步</h2>
+          <p class="card-sub">topic {{ keySyncTopic }}：一台设备按下组合，同组设备按各自规则注入目标按键</p>
+        </div>
+      </div>
+
+      <label class="switch" :class="{ disabled: keySyncBusy }">
+        <input
+          type="checkbox"
+          :checked="form.keySyncEnabled"
+          :disabled="keySyncBusy"
+          @change="toggleKeySync"
+        />
+        <span class="track"><span class="thumb"></span></span>
+        <span class="switch-text">开启按键同步</span>
+      </label>
+
+      <div v-if="form.keySyncEnabled" class="keysync-rules">
+        <div v-for="row in rows" :key="row.id" class="keysync-row" :class="{ off: !row.enabled }">
+          <label class="mini-switch" :title="row.enabled ? '停用该规则（组合保留）' : '启用该规则'">
+            <input
+              type="checkbox"
+              :checked="row.enabled"
+              :disabled="keySyncBusy"
+              @change="toggleRowEnabled(row)"
+            />
+            <span class="track"><span class="thumb"></span></span>
+          </label>
+
+          <div class="combo-cell">
+            <input
+              v-model="row.sourceText"
+              class="combo-input"
+              :class="{ invalid: row.sourceError }"
+              type="text"
+              placeholder="按下组合录制，如 Ctrl+F9"
+              spellcheck="false"
+              autocomplete="off"
+              @keydown="comboKeydown($event, row, 'source')"
+              @keyup="comboKeyup($event, row, 'source')"
+              @blur="comboBlur(row, 'source')"
+            />
+            <p v-if="row.sourceError" class="row-err">{{ row.sourceError }}</p>
+          </div>
+
+          <span class="keysync-arrow" aria-hidden="true">→</span>
+
+          <div class="combo-cell">
+            <input
+              v-model="row.targetText"
+              class="combo-input"
+              :class="{ invalid: row.targetError }"
+              type="text"
+              placeholder="注入组合录制，如 Cmd+Down"
+              spellcheck="false"
+              autocomplete="off"
+              @keydown="comboKeydown($event, row, 'target')"
+              @keyup="comboKeyup($event, row, 'target')"
+              @blur="comboBlur(row, 'target')"
+            />
+            <p v-if="row.targetError" class="row-err">{{ row.targetError }}</p>
+          </div>
+
+          <select v-model="row.platform" :disabled="keySyncBusy" @change="scheduleKeySyncSave()">
+            <option value="all">全部平台</option>
+            <option value="windows">仅 Windows</option>
+            <option value="macos">仅 macOS</option>
+          </select>
+
+          <input
+            v-model="row.note"
+            type="text"
+            class="keysync-note"
+            placeholder="备注"
+            spellcheck="false"
+            autocomplete="off"
+            maxlength="30"
+            @input="scheduleKeySyncSave()"
+          />
+
+          <button class="ghost remove" type="button" :disabled="keySyncBusy" @click="removeRow(row)">
+            删除
+          </button>
+        </div>
+
+        <div class="keysync-foot">
+          <button type="button" :disabled="keySyncBusy" @click="addRow">＋ 添加规则</button>
+          <span v-if="rowsDirty" class="dirty-hint">有未保存的改动（5 秒后自动保存）</span>
+          <span v-else-if="keySyncBusy" class="dirty-hint">保存中…</span>
+        </div>
+      </div>
+
+      <p v-if="keySyncError" class="hint err">{{ keySyncError }}</p>
+      <p v-else-if="keySyncSaved" class="hint ok">按键同步设置已保存</p>
+      <p v-else class="hint">
+        规则需在<strong>收发两端各自配置且源组合一致</strong>：发送端按下「源组合」后立即广播，
+        接收端按本机启用的规则注入「目标组合」——每台设备可映射到不同按键
+        （如 Windows 发 Ctrl+↓，macOS 收到后按 F9）。Windows 后台失焦也生效；
+        macOS 需允许键盘事件监听（系统设置 → 隐私与安全性 → 输入监视，勾选 desktools
+        后重新打开总开关）。组合框支持直接按下录制（Esc 取消），也可粘贴文本后失焦解析；
+        主键支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End。
+      </p>
+    </section>
+
     <!-- 启动 -->
     <section class="card">
       <div class="card-head">
@@ -683,5 +1056,132 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+/* ---------- 按键同步规则行 ---------- */
+.keysync-rules {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.keysync-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr) 108px minmax(96px, 140px) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.keysync-row.off {
+  opacity: 0.6;
+}
+
+.combo-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.keysync-row input,
+.keysync-row select {
+  width: 100%;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+  user-select: text;
+}
+
+.keysync-row input:focus,
+.keysync-row select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.combo-input.invalid {
+  border-color: var(--err);
+}
+
+.combo-input.invalid:focus {
+  box-shadow: 0 0 0 3px var(--err-soft);
+}
+
+.keysync-arrow {
+  color: var(--text-secondary);
+  padding: 0 1px;
+}
+
+.row-err {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  color: var(--err);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.keysync-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dirty-hint {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+/* 小号开关（规则行内的启用 / 禁用） */
+.mini-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.mini-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.mini-switch .track {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(128, 138, 156, 0.35);
+  transition: background 0.18s;
+  flex-shrink: 0;
+}
+
+.mini-switch .thumb {
+  position: absolute;
+  top: 2.5px;
+  left: 2.5px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 0.18s;
+}
+
+.mini-switch input:checked + .track {
+  background: var(--accent);
+}
+
+.mini-switch input:checked + .track .thumb {
+  transform: translateX(12px);
 }
 </style>

@@ -12,6 +12,7 @@ use crate::auto_lock::{self, AutoLockState};
 use crate::clipboard;
 use crate::config::MqttConfig;
 use crate::history::{HistoryState, now_ms};
+use crate::key_sync;
 use crate::lock_sync::{self, LockSyncState};
 use crate::logger::{self, ERROR, INFO, WARN};
 
@@ -61,6 +62,8 @@ pub enum QueuedMsg {
     Csi(String),
     /// 锁屏同步消息（locksync/<group>）
     LockSync(String),
+    /// 按键同步消息（keysync/<group>）
+    KeySync(String),
 }
 /// 本机发布内容的回流识别：只保留最近若干条、数十秒内有效。
 /// 回流链路 = 本机发布 → 对端收到（网络延迟）→ 对端监听线程周期（≤700ms）→ 回发 → 本机收到，
@@ -252,6 +255,13 @@ pub fn start(app: AppHandle, cfg: MqttConfig) {
                             let _ = client.subscribe(lock_topic.clone(), QoS::AtLeastOnce).await;
                             logger::log(&app, INFO, format!("锁屏同步已开启，已订阅 {lock_topic}"));
                         }
+                        // 按键同步开启时订阅 keysync/<group>：
+                        // 发送端同样需要订阅（收到远端组合后按本机规则注入）
+                        if cfg.key_sync_enabled {
+                            let key_topic = key_sync::topic(&cfg.group);
+                            let _ = client.subscribe(key_topic.clone(), QoS::AtLeastOnce).await;
+                            logger::log(&app, INFO, format!("按键同步已开启，已订阅 {key_topic}"));
+                        }
                     }
                     set_status(&app, "connected", "已连接", topic.clone());
                 }
@@ -296,9 +306,12 @@ fn handle_incoming(app: &AppHandle, topic: &str, payload: &[u8]) {
         return;
     }
     let raw = String::from_utf8_lossy(payload).to_string();
+    let group = current_group(app);
     let msg = if topic == auto_lock::CSI_NOTIFY_TOPIC {
         QueuedMsg::Csi(raw)
-    } else if topic == lock_sync::topic(&current_group(app)) {
+    } else if topic == key_sync::topic(&group) {
+        QueuedMsg::KeySync(raw)
+    } else if topic == lock_sync::topic(&group) {
         QueuedMsg::LockSync(raw)
     } else {
         QueuedMsg::Clip(raw)
@@ -324,6 +337,7 @@ pub fn spawn_message_worker(app: AppHandle) {
                     QueuedMsg::LockSync(raw) => {
                         app.state::<LockSyncState>().handle_event(&app, &raw)
                     }
+                    QueuedMsg::KeySync(raw) => key_sync::handle_remote_message(&app, &raw),
                 }
             }
         });

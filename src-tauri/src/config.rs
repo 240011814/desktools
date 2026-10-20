@@ -177,6 +177,13 @@ pub struct MqttConfig {
     /// （人正在用的设备不被联动锁屏）。0 = 关闭守卫，总是跟随。
     #[serde(default = "default_lock_sync_idle_guard_secs")]
     pub lock_sync_idle_guard_secs: u64,
+    /// 按键同步：总开关（默认关闭）。开启后本机按下配置的按键组合会广播给同组设备，
+    /// 收到同组设备的按键组合时按本机规则注入目标组合。
+    #[serde(default)]
+    pub key_sync_enabled: bool,
+    /// 按键同步规则列表（源组合 → 目标组合，见 key_sync::KeySyncRule）
+    #[serde(default)]
+    pub key_sync_rules: Vec<crate::key_sync::KeySyncRule>,
     /// 开机自动启动（持久化「意图」；应用启动时与系统实际状态对齐，见 autostart 模块）
     #[serde(default = "default_auto_start")]
     pub auto_start: bool,
@@ -213,6 +220,8 @@ impl Default for MqttConfig {
             lock_sync_publish: false,
             lock_sync_follow: false,
             lock_sync_idle_guard_secs: default_lock_sync_idle_guard_secs(),
+            key_sync_enabled: false,
+            key_sync_rules: Vec::new(),
             auto_start: default_auto_start(),
             minio: MinioConfig::default(),
         }
@@ -401,6 +410,66 @@ mod tests {
         assert!(!cfg.lock_sync_publish);
         assert!(!cfg.lock_sync_follow);
         assert_eq!(cfg.lock_sync_idle_guard_secs, 300);
+    }
+
+    #[test]
+    fn key_sync_defaults_off_for_legacy_config() {
+        // 没有 keySync 字段的历史配置：总开关默认关闭、规则为空，升级后不改变行为
+        let legacy = r#"{
+            "host": "broker.emqx.io",
+            "port": 1883,
+            "username": "",
+            "password": "",
+            "tls": false,
+            "group": "g1",
+            "deviceId": "dev-1"
+        }"#;
+        let cfg: MqttConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!cfg.key_sync_enabled);
+        assert!(cfg.key_sync_rules.is_empty());
+    }
+
+    #[test]
+    fn key_sync_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("desktools-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut cfg = MqttConfig::default();
+        cfg.key_sync_enabled = true;
+        cfg.key_sync_rules = vec![
+            crate::key_sync::KeySyncRule {
+                id: "rule-1".into(),
+                enabled: true,
+                source: crate::key_sync::KeyCombo {
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    meta: false,
+                    key: "f9".into(),
+                },
+                target: crate::key_sync::KeyCombo {
+                    ctrl: false,
+                    alt: true,
+                    shift: false,
+                    meta: false,
+                    key: "down".into(),
+                },
+                platform: crate::key_sync::PLATFORM_MACOS.into(),
+                note: "跨端映射".into(),
+            },
+            crate::key_sync::KeySyncRule {
+                id: "rule-2".into(),
+                enabled: false,
+                source: crate::key_sync::KeyCombo::default(),
+                target: crate::key_sync::KeyCombo::default(),
+                platform: crate::key_sync::PLATFORM_ALL.into(),
+                note: String::new(),
+            },
+        ];
+        cfg.save(&path).unwrap();
+        let loaded = MqttConfig::load(&path);
+        assert!(loaded.key_sync_enabled);
+        assert_eq!(loaded.key_sync_rules, cfg.key_sync_rules);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

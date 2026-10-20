@@ -1,6 +1,10 @@
 import { ref } from "vue";
+import type { KeyCombo, KeySyncRule } from "./keysync";
 
 /* 侧边栏与各页面共享的状态与类型 */
+
+/** 按键同步的组合 / 规则类型（语义见 src/keysync.ts） */
+export type { KeyCombo, KeySyncRule };
 
 /** 文件中转站（MinIO）配置；Access Key / Secret Key 本地加密存储 */
 export interface MinioConfig {
@@ -32,6 +36,10 @@ export interface MqttConfig {
   lockSyncFollow: boolean;
   /** 活跃守卫阈值（秒）：本机近 X 秒内有键鼠输入则跳过远端锁屏；0 = 关闭守卫 */
   lockSyncIdleGuardSecs: number;
+  /** 按键同步：总开关（本机按下源组合后广播，收到远端组合按本机规则注入） */
+  keySyncEnabled: boolean;
+  /** 按键同步规则列表（源组合 → 目标组合；规则需在收发两端各自配置） */
+  keySyncRules: KeySyncRule[];
   /** 开机自动启动（持久化意图；由应用启动时与系统实际状态对齐） */
   autoStart: boolean;
   /** 文件中转站（MinIO）配置 */
