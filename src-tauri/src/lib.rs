@@ -344,12 +344,14 @@ fn clear_logs(app: tauri::AppHandle) {
     logger::log(&app, logger::INFO, "日志已清空");
 }
 
-#[tauri::command]
+/// 同步命令默认跑在主线程；status()/set_enabled() 需拉起 reg.exe（Windows）、pbs（macOS）
+/// 等子进程并等待退出，会挡住窗口消息循环导致设置页整窗冻结几秒，故标 async 挪到后台线程
+#[tauri::command(async)]
 fn get_desktop_integration() -> shell_integration::IntegrationStatus {
     shell_integration::status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_desktop_integration(
     app: tauri::AppHandle,
     enabled: bool,

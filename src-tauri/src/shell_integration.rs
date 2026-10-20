@@ -154,9 +154,10 @@ pub fn status() -> IntegrationStatus {
         .filter(|entry| entry_installed(entry))
         .map(|entry| entry.label)
         .collect();
+    // enabled 以主条目为准；复用上面已查询的结果，少拉起一次 reg.exe 子进程
     IntegrationStatus {
         supported: true,
-        enabled: entry_installed(&ENTRIES[0]),
+        enabled: installed.contains(&ENTRIES[0].label),
         detail: if installed.is_empty() {
             "未启用".into()
         } else {
@@ -444,9 +445,10 @@ pub fn status() -> IntegrationStatus {
         .filter(|entry| entry_installed(entry))
         .map(|entry| entry.label)
         .collect();
+    // enabled 以主条目为准；复用上面已查询的结果，避免重复探测
     IntegrationStatus {
         supported: true,
-        enabled: entry_installed(&ENTRIES[0]),
+        enabled: installed.contains(&ENTRIES[0].label),
         detail: if installed.is_empty() {
             format!("未启用（启用后安装到 ~/Library/Services，程序路径：{exe}）")
         } else {
