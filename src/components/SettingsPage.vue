@@ -9,6 +9,7 @@ import {
   emptyCombo,
   isModifierOnlyKey,
   parseComboText,
+  parseModifierPrefix,
   previewCombo,
   validateRule,
 } from "../keysync";
@@ -336,6 +337,12 @@ function applyCombo(row: KeysyncRow, field: "source" | "target", combo: KeyCombo
 /** keydown 录制：识别出的组合立即提交；修饰键单独按下时先显示预览；
  *  其余键（退格 / 方向键等）不拦截，留给手动编辑。Escape 取消恢复 */
 function comboKeydown(e: KeyboardEvent, row: KeysyncRow, field: "source" | "target") {
+  if (e.key === "Enter") {
+    // 手动键入后回车 = 提交解析（与失焦一致）
+    e.preventDefault();
+    (e.target as HTMLInputElement).blur();
+    return;
+  }
   if (e.key === "Escape") {
     e.preventDefault();
     restoreComboText(row, field);
@@ -424,6 +431,53 @@ function removeRow(row: KeysyncRow) {
 function toggleRowEnabled(row: KeysyncRow) {
   row.enabled = !row.enabled;
   scheduleKeySyncSave();
+}
+
+/** 主键速选集合（canonical 名 → 显示名） */
+const QUICK_KEYS: Array<[string, string]> = [
+  ["up", "↑"],
+  ["down", "↓"],
+  ["left", "←"],
+  ["right", "→"],
+  ["pageUp", "PgUp"],
+  ["pageDown", "PgDn"],
+  ["home", "Home"],
+  ["end", "End"],
+];
+
+/** 点击主键速选：构造「输入框现有修饰键（或鼠标按着的修饰键）+ 该主键」的组合。
+ * 修饰键来源优先级：鼠标点击时物理按着的 > 输入框文本（含 `Ctrl+` 未完前缀）> 无；
+ * 框为空且未按修饰键时即产生单键映射（无修饰键） */
+function pickQuickKey(
+  e: MouseEvent,
+  row: KeysyncRow,
+  field: "source" | "target",
+  keyName: string,
+) {
+  let combo: KeyCombo = { ...emptyCombo(), key: keyName };
+  if (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) {
+    combo.ctrl = e.ctrlKey;
+    combo.alt = e.altKey;
+    combo.shift = e.shiftKey;
+    combo.meta = e.metaKey;
+  } else {
+    const slot = field === "source" ? "sourceText" : "targetText";
+    const text = row[slot].trim();
+    if (text.endsWith("…")) {
+      // 录制预览残留（keyup 恢复被点击打断）不可靠：恢复原文并退出
+      restoreComboText(row, field);
+      return;
+    }
+    const prefix = parseModifierPrefix(text);
+    if (prefix) {
+      combo = { ...prefix, key: keyName };
+    } else {
+      const parsed = parseComboText(text);
+      if (typeof parsed !== "string") combo = { ...parsed, key: keyName };
+    }
+  }
+  applyCombo(row, field, combo);
+  (e.currentTarget as HTMLElement | null)?.blur();
 }
 
 async function saveKeySync() {
@@ -909,6 +963,19 @@ onMounted(() => {
               @keyup="comboKeyup($event, row, 'source')"
               @blur="comboBlur(row, 'source')"
             />
+            <div class="keysync-quick">
+              <button
+                v-for="[value, label] in QUICK_KEYS"
+                :key="value"
+                type="button"
+                class="quick-key"
+                :disabled="keySyncBusy"
+                @mousedown.prevent
+                @click="pickQuickKey($event, row, 'source', value)"
+              >
+                {{ label }}
+              </button>
+            </div>
             <p v-if="row.sourceError" class="row-err">{{ row.sourceError }}</p>
           </div>
 
@@ -927,6 +994,19 @@ onMounted(() => {
               @keyup="comboKeyup($event, row, 'target')"
               @blur="comboBlur(row, 'target')"
             />
+            <div class="keysync-quick">
+              <button
+                v-for="[value, label] in QUICK_KEYS"
+                :key="value"
+                type="button"
+                class="quick-key"
+                :disabled="keySyncBusy"
+                @mousedown.prevent
+                @click="pickQuickKey($event, row, 'target', value)"
+              >
+                {{ label }}
+              </button>
+            </div>
             <p v-if="row.targetError" class="row-err">{{ row.targetError }}</p>
           </div>
 
@@ -963,11 +1043,13 @@ onMounted(() => {
       <p v-else-if="keySyncSaved" class="hint ok">按键同步设置已保存</p>
       <p v-else class="hint">
         规则需在<strong>收发两端各自配置且源组合一致</strong>：发送端按下「源组合」后立即广播，
-        接收端按本机启用的规则注入「目标组合」——每台设备可映射到不同按键
-        （如 Windows 发 Ctrl+↓，macOS 收到后按 F9）。Windows 后台失焦也生效；
-        macOS 需允许键盘事件监听（系统设置 → 隐私与安全性 → 输入监视，勾选 desktools
-        后重新打开总开关）。组合框支持直接按下录制（Esc 取消），也可粘贴文本后失焦解析；
-        主键支持字母 / 数字 / F1~F12 / 方向键 / PageUp / PageDown / Home / End。
+        接收端按本机启用的规则注入「目标组合」——每台设备可映射到不同按键，目标组合也支持
+        <strong>单键</strong>（如仅 F9 / 仅 ↓，点下方主键按钮即可直接填入）。组合框支持按下录制
+        与手动键入键名（回车或失焦提交）；<b>方向键 ↑↓←→、Home、End 用输入框下方的按钮点选</b>。
+        macOS 说明：Ctrl+↑↓ / Ctrl+←→ / Ctrl+Space 等被系统快捷键（调度中心 / 切换空间 /
+        输入法）优先处理，直接按键录不到——请用按钮或键名输入，或到「系统设置 → 键盘 →
+        键盘快捷键」临时停用对应项后录制；安装引擎需允许键盘事件监听
+        （系统设置 → 隐私与安全性 → 输入监视，勾选 desktools 后重新打开总开关）。
       </p>
     </section>
 
@@ -1126,6 +1208,25 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 主键速选（方向键等系统快捷键易占用 / 单键映射的主键快速填入） */
+.keysync-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.quick-key {
+  padding: 1px 8px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  border-radius: 7px;
+}
+
+.quick-key:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .keysync-foot {

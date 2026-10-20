@@ -191,6 +191,26 @@ export function modifierMaskOf(raw: string): number {
   }
 }
 
+/** 解析「未完成前缀」组合文本：`Ctrl+` / `Ctrl+Shift+`（只有修饰键、还没有主键）。
+ * 供输入框「主键速选」保留已录修饰键用；完整组合请用 parseComboText。
+ * 仅接受以 + 结尾的明确未完成写法；含非法段返回 null */
+export function parseModifierPrefix(input: string): KeyCombo | null {
+  const trimmed = input.trim();
+  if (!trimmed || !trimmed.endsWith("+")) return null;
+  const combo = emptyCombo();
+  let any = false;
+  for (const part of trimmed.slice(0, -1).split("+")) {
+    const mask = modifierMaskOf(part.trim());
+    if (mask === 0) return null;
+    if (mask & MOD_CTRL) combo.ctrl = true;
+    if (mask & MOD_ALT) combo.alt = true;
+    if (mask & MOD_SHIFT) combo.shift = true;
+    if (mask & MOD_META) combo.meta = true;
+    any = true;
+  }
+  return any ? combo : null;
+}
+
 /** 解析组合文本（手动编辑 / 录制回填统一入口）：`Ctrl+Shift+↓` / `alt+f9` / `Cmd+Down` */
 export function parseComboText(input: string): KeyCombo | string {
   const parts = input

@@ -18,6 +18,7 @@ import {
   MOD_SHIFT,
   normalizeKeyName,
   parseComboText,
+  parseModifierPrefix,
   platformApplies,
   PLATFORM_ALL,
   PLATFORM_MACOS,
@@ -177,6 +178,27 @@ test("platformApplies: 目标平台过滤", () => {
   assert.equal(platformApplies(rule(true, "F9", "F10", PLATFORM_MACOS, "r"), os), true);
   assert.equal(platformApplies(rule(true, "F9", "F10", PLATFORM_WINDOWS, "r"), os), false);
   assert.equal(platformApplies(rule(true, "F9", "F10", PLATFORM_ALL, "r"), os), true);
+});
+
+/* ---------- 未完成前缀（主键速选用） ---------- */
+
+test("parseModifierPrefix: Ctrl+ / Ctrl+Shift+ 保留修饰键；完整组合与非前缀返回 null", () => {
+  assert.deepEqual(parseModifierPrefix("Ctrl+"), { ...emptyCombo(), ctrl: true });
+  assert.deepEqual(parseModifierPrefix("Ctrl+Shift+"), {
+    ...emptyCombo(),
+    ctrl: true,
+    shift: true,
+  });
+  assert.deepEqual(parseModifierPrefix("Win+Cmd+"), { ...emptyCombo(), meta: true });
+  // 完整组合不是前缀
+  assert.equal(parseModifierPrefix("ctrl+down"), null);
+  // 非法段
+  assert.equal(parseModifierPrefix("Ctrl+Foo+"), null);
+  assert.equal(parseModifierPrefix("ctrl++"), null);
+  // 非 + 结尾 / 空
+  assert.equal(parseModifierPrefix("F9"), null);
+  assert.equal(parseModifierPrefix("ctrl"), null);
+  assert.equal(parseModifierPrefix("  "), null);
 });
 
 /* ---------- fromEvent（录制） ---------- */
