@@ -2,3 +2,4 @@
 /src-tauri/gen
 /dist
 .DS_Store
+desktools-dev.p12
