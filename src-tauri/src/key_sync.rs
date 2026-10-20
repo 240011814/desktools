@@ -710,9 +710,12 @@ pub enum EngineStart {
     Idle,
 }
 
-/// 引擎启动失败：Permission（macOS 缺权限等，可自动回退关闭）/ Failed（其他错误）
+/// 引擎启动失败：Permission（macOS 缺权限等，可自动回退关闭）/ Failed（其他错误）。
+/// Permission 由 macOS 权限预检构造；Windows 构建下永远不构造（dead-code 特召回宽），
+/// 不能用 #[expect(dead_code)]——macOS 下该 expect 不生效反而会报错。
 #[derive(Debug, Clone)]
 pub enum EngineError {
+    #[allow(dead_code)] // 仅 macOS 构造；Windows 构建下从未构造
     Permission(String),
     Failed(String),
 }
@@ -1011,7 +1014,8 @@ mod windows_impl {
                 *WIN_THREAD_ID.lock().unwrap() = GetCurrentThreadId();
                 let _ = ready_tx.send(Ok(()));
                 // 消息泵：钩子回调依赖本线程的消息循环保持活跃；WM_QUIT 到达后退出并卸载
-                let mut message: MSG = unsafe { std::mem::zeroed() };
+                // （外层 unsafe 已覆盖，edition 2024 下再写内层 unsafe 会报 unused_unsafe）
+                let mut message: MSG = std::mem::zeroed();
                 while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {}
                 UnhookWindowsHookEx(hook);
             });
