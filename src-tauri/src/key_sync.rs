@@ -1052,31 +1052,46 @@ pub enum StartupHeal {
 #[cfg(target_os = "macos")]
 const STABLE_SIGNING_IDENTITY: &str = "desktools-dev";
 
+/// 启动后延迟多久开始权限真实性回环验证（避开启动高峰）
+#[cfg(target_os = "macos")]
+const PROBE_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 单步媒体键注入后的观察等待时间（与 macos_impl::probe_media_key_injection 保持一致）
+#[cfg(target_os = "macos")]
+const PROBE_SETTLE_MILLIS: u64 = 400;
+
 /// 启动时自动检查 macOS 辅助功能（模拟按键）权限：
-/// - 已授权：直接跳过，不打扰用户。
-/// - 未授权且签名异常（如被 GitHub release 的 ad-hoc 更新包覆盖）：
-///   本机 keychain 若有稳定证书，就自动重签重启，重启后 TCC 记录会重新匹配，无需再授权。
-/// - 未授权且签名正常 / 无法重签：主动弹出系统授权面板。
+/// - 预检明确未授权：立即走自修复（重签 / 重置 TCC 记录）/ 主动弹系统授权面板。
+/// - 预检「已授权」也可能误报（如 ad-hoc 升级包覆盖安装后事件实际仍被丢弃），
+///   启动几秒后用 F11/F12 音量回环做一次真实验证，异常时再走自修复。
 #[cfg(target_os = "macos")]
 pub fn startup_self_heal(app: &AppHandle) -> StartupHeal {
-    // 仅在「明确返回 false」时动作；预检 API 缺失（None）或误报时保持现状
-    if macos_impl::post_access_ok() != Some(false) {
-        return StartupHeal::Ok;
+    if macos_impl::post_access_ok() == Some(false) {
+        return heal_missing_permission(app);
     }
+    spawn_truth_probe(app.clone());
+    StartupHeal::Ok
+}
 
+/// 缺权限时的自修复路径（同步阶段与后台真实性验证失败共用）
+#[cfg(target_os = "macos")]
+fn heal_missing_permission(app: &AppHandle) -> StartupHeal {
     let Some(bundle) = installed_app_bundle() else {
         // 开发构建 / 非标准安装位置：请求授权即可
         macos_impl::request_post_access();
         return StartupHeal::Ok;
     };
 
-    if is_signed_with_stable_identity(&bundle) {
-        // 签名正常但仍未授权：首次安装或开关被动手动调整，主动请求授权
-        macos_impl::request_post_access();
-        return StartupHeal::Ok;
-    }
-
-    if !keychain_has_stable_identity() {
+    if !is_signed_with_stable_identity(&bundle) {
+        if keychain_has_stable_identity() {
+            logger::log(
+                app,
+                WARN,
+                "按键同步权限未生效，且安装包签名异常：自动以 desktools-dev 重新签名并重启应用（重启后若之前授权过该身份，无需再确认）",
+            );
+            spawn_repair_and_relaunch(&bundle);
+            return StartupHeal::Relaunching;
+        }
         logger::log(
             app,
             WARN,
@@ -1086,13 +1101,68 @@ pub fn startup_self_heal(app: &AppHandle) -> StartupHeal {
         return StartupHeal::Ok;
     }
 
+    // 签名正常但仍未授权：疑似残留的 TCC 记录；清一次再弹授权面板
     logger::log(
         app,
         WARN,
-        "按键同步权限未生效，且安装包签名异常：自动以 desktools-dev 重新签名并重启应用（重启后若之前授权过该身份，无需再确认）",
+        "按键同步权限未生效（签名正常，疑似 TCC 记录残留）：已重置该应用权限记录并弹出系统授权面板",
     );
-    spawn_repair_and_relaunch(&bundle);
-    StartupHeal::Relaunching
+    run_tccutil_reset(app);
+    macos_impl::request_post_access();
+    StartupHeal::Ok
+}
+
+/// 启动后用 F11/F12 媒体键音量回环真实验证一次注入是否生效
+/// （预检 CGPreflightPostEventAccess 在部分环境会误报为「已授权」）
+#[cfg(target_os = "macos")]
+fn spawn_truth_probe(app: AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(PROBE_DELAY);
+        match macos_impl::probe_media_key_injection() {
+            Some(true) => {
+                logger::log(&app, INFO, "按键同步权限自检：通过（模拟按键事件真实生效）");
+            }
+            Some(false) => {
+                logger::log(
+                    &app,
+                    WARN,
+                    "按键同步权限自检：预检通过但事件注入实际无效（常见于 ad-hoc 升级包覆盖安装），尝试自动修复",
+                );
+                if heal_missing_permission(&app) == StartupHeal::Relaunching {
+                    app.exit(0);
+                }
+            }
+            // 静音等场景观察不到音量变化，不做冒然重签；
+            // 收到远端按键时仍会按需触发权限提示
+            None => {}
+        }
+    });
+}
+
+/// 重置本应用的 macOS「辅助功能」TCC 记录（无需管理员权限）
+#[cfg(target_os = "macos")]
+fn run_tccutil_reset(app: &AppHandle) {
+    let out = Command::new("/usr/bin/tccutil")
+        .args(["reset", "Accessibility", "com.hyy.desktools"])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            logger::log(app, INFO, "macOS 辅助功能记录已重置（com.hyy.desktools）");
+        }
+        Ok(out) => {
+            logger::log(
+                app,
+                WARN,
+                format!(
+                    "macOS 辅助功能记录重置失败：{}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            );
+        }
+        Err(err) => {
+            logger::log(app, WARN, format!("macOS 辅助功能记录重置失败：{err}"));
+        }
+    }
 }
 
 /// 仅对 /Applications 下的 .app 安装形式识别 bundle 路径；开发/调试构建返回 None
@@ -1185,8 +1255,10 @@ fn identity_list_contains_stable(identity_list: &str) -> bool {
 fn spawn_repair_and_relaunch(bundle: &Path) {
     let bundle_arg = shell_quoted(bundle);
     let log_file = shell_quoted(&std::env::temp_dir().join("desktools-selfheal.log"));
+    // 自退 + 重签 + 重启独立于调用方执行；即便 app.exit 未立即生效也能兜底
+    let pid = std::process::id();
     let script = format!(
-        "sleep 1.5 && codesign --force --deep --sign {STABLE_SIGNING_IDENTITY} {bundle_arg} >> {log_file} 2>&1 && open {bundle_arg}",
+        "sleep 1 && kill -TERM {pid} 2>/dev/null; sleep 1.5 && codesign --force --deep --sign {STABLE_SIGNING_IDENTITY} {bundle_arg} >> {log_file} 2>&1 && open {bundle_arg}",
     );
     // 用分离子进程执行：主进程退出后脚本仍继续跑，完成重签与重启
     let _ = Command::new("sh")
@@ -2227,6 +2299,58 @@ mod macos_impl {
             }
         }
         Ok(())
+    }
+
+    /// 通过 F11/F12 媒体键音量回环，验证 CGEventPost 是否真实生效：
+    /// Some(true) = 音量发生变化（注入确实生效）；Some(false) = 音量无变化（事件被
+    /// 系统丢弃，通常是授权失效）；None = 无法验证（静音 / 读取失败等），不做冒然结论。
+    /// ⚠️ 副作用：期间音量最多变化一格并立刻回弹（共 2 次媒体键注入）。
+    pub(super) fn probe_media_key_injection() -> Option<bool> {
+        // 读取系统音量只用 StandardAdditions，不涉及跨应用自动化权限
+        let osascript_query = |code: &str| -> Option<String> {
+            let out = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(code)
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let read_volume = || -> Option<u32> {
+            osascript_query("output volume of (get volume settings)")?
+                .parse::<u32>()
+                .ok()
+        };
+        match osascript_query("output muted of (get volume settings)").as_deref() {
+            Some("false") => {}
+            _ => return None, // 静音 / 读取失败：观察不到音量变化，不冒然下结论
+        }
+
+        let before = read_volume()?;
+        // 音量表 ≤50 用 F12（音量加）更可能产生变化；>50 用 F11（音量减）；反方向回弹
+        let (probe, restore) = if before <= 50 {
+            ("f12", "f11")
+        } else {
+            ("f11", "f12")
+        };
+        let press = |key: &str| {
+            inject(&KeyCombo {
+                key: key.to_string(),
+                ..Default::default()
+            })
+        };
+
+        if press(probe).is_err() {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(PROBE_SETTLE_MILLIS));
+        let after_probe = read_volume()?;
+        if press(restore).is_err() {
+            return Some(false);
+        }
+        Some(after_probe != before)
     }
 }
 
