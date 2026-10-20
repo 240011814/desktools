@@ -736,6 +736,9 @@ fn inject_remote_combo(
     // 注入权限（辅助功能）预检仅用于提示：预检可能误报，注入照常尝试
     #[cfg(target_os = "macos")]
     if macos_impl::post_access_ok() == Some(false) && state.take_post_permission_warning() {
+        // 首次缺权限时主动弹一次系统授权面板（已拒绝过的不会重复弹）
+        let main_app = app.clone();
+        let _ = main_app.run_on_main_thread(macos_impl::request_post_access);
         logger::log(
             app,
             WARN,
@@ -745,12 +748,24 @@ fn inject_remote_combo(
             ),
         );
     }
+    let media_note = {
+        #[cfg(target_os = "macos")]
+        {
+            macos_impl::media_target(target)
+                .map(|label| format!("（macOS 媒体键：{label}）"))
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            String::new()
+        }
+    };
     match inject_combo(target) {
         Ok(()) => logger::log(
             app,
             INFO,
             format!(
-                "按键同步：收到设备 {device} 的 {}，{action_desc} {}",
+                "按键同步：收到设备 {device} 的 {}，{action_desc} {}{media_note}",
                 display_combo(source, os),
                 display_combo(target, os)
             ),
@@ -1261,9 +1276,9 @@ fn windows_inject_combo(combo: &KeyCombo) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use super::*;
-    use std::ffi::c_void;
+    use std::ffi::{CString, c_void};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::auto_lock::{dlsym_checked, open_framework};
 
@@ -1296,6 +1311,24 @@ mod macos_impl {
     const CG_FLAG_ALTERNATE: u64 = 0x0008_0000;
     /// kCGEventFlagMaskCommand（1 << 20）
     const CG_FLAG_COMMAND: u64 = 0x0010_0000;
+
+    /* ---- 媒体键（IOKit/hidsystem/ev_keymap.h 的 NX_KEYTYPE_*） ---- */
+    /// NX_KEYTYPE_SOUND_UP（音量 +）
+    const NX_KEYTYPE_SOUND_UP: u32 = 0;
+    /// NX_KEYTYPE_SOUND_DOWN（音量 -）
+    const NX_KEYTYPE_SOUND_DOWN: u32 = 1;
+    /// NX_KEYTYPE_MUTE（静音）
+    const NX_KEYTYPE_MUTE: u32 = 7;
+    /// NX_KEYTYPE_PLAY（播放 / 暂停）
+    const NX_KEYTYPE_PLAY: u32 = 16;
+    /// NX_KEYTYPE_NEXT（下一首）
+    const NX_KEYTYPE_NEXT: u32 = 17;
+    /// NX_KEYTYPE_PREVIOUS（上一首）
+    const NX_KEYTYPE_PREVIOUS: u32 = 18;
+    /// NSEventTypeSystemDefined
+    const NS_EVENT_TYPE_SYSTEM_DEFINED: u64 = 14;
+    /// NX_SUBTYPE_AUX_CONTROL_BUTTONS
+    const NX_SUBTYPE_AUX_CONTROL_BUTTONS: i16 = 8;
 
     type TapCallback = unsafe extern "C" fn(
         proxy: *mut c_void,
@@ -1332,6 +1365,28 @@ mod macos_impl {
     type ReleaseFn = unsafe extern "C" fn(reference: *mut c_void);
     type PreflightFn = unsafe extern "C" fn() -> bool;
 
+    /* ---- Objective-C / AppKit：构造 NX_SYSDEFINED 媒体键事件 ---- */
+    type GetClassFn = unsafe extern "C" fn(name: *const std::ffi::c_char) -> *mut c_void;
+    type SelRegisterFn = unsafe extern "C" fn(name: *const std::ffi::c_char) -> *mut c_void;
+    type AutoreleasePoolPushFn = unsafe extern "C" fn() -> *mut c_void;
+    type AutoreleasePoolPopFn = unsafe extern "C" fn(pool: *mut c_void);
+    type OtherEventFn = unsafe extern "C" fn(
+        class: *mut c_void,
+        selector: *mut c_void,
+        event_type: u64,
+        x: f64,
+        y: f64,
+        flags: u64,
+        timestamp: f64,
+        window_number: i64,
+        context: *mut c_void,
+        subtype: i16,
+        data1: i64,
+        data2: i64,
+    ) -> *mut c_void;
+    type NsEventToCgFn =
+        unsafe extern "C" fn(event: *mut c_void, selector: *mut c_void) -> *mut c_void;
+
     /// dlsym 出的函数指针集合（data 符号以 usize 存地址，保证 Send/Sync）
     struct MacApi {
         tap_create: TapCreateFn,
@@ -1356,6 +1411,8 @@ mod macos_impl {
         preflight_listen: Option<PreflightFn>,
         /// CGPreflightPostEventAccess（10.15+，缺失时跳过预检）
         preflight_post: Option<PreflightFn>,
+        /// CGRequestPostEventAccess（10.15+，缺失时不主动弹权限面板）
+        request_post: Option<PreflightFn>,
     }
 
     // 纯函数指针 + 从 CF 全局常量读出的不可变值，跨线程共享只读安全
@@ -1402,6 +1459,8 @@ mod macos_impl {
                     .map(|ptr| unsafe { std::mem::transmute::<*mut c_void, PreflightFn>(ptr) }),
                 preflight_post: dlsym_checked(cg, "CGPreflightPostEventAccess")
                     .map(|ptr| unsafe { std::mem::transmute::<*mut c_void, PreflightFn>(ptr) }),
+                request_post: dlsym_checked(cg, "CGRequestPostEventAccess")
+                    .map(|ptr| unsafe { std::mem::transmute::<*mut c_void, PreflightFn>(ptr) }),
             })
         }
     }
@@ -1430,7 +1489,7 @@ mod macos_impl {
 
     /// 注入权限提示（辅助功能）：CGEventPost 投递按键需要；预检可能误报，不阻断注入
     pub(super) fn post_permission_hint() -> String {
-        "macOS 系统报告未授予「模拟按键」权限（辅助功能）：注入仍会尝试；若目标应用无反应，请在 系统设置 → 隐私与安全性 → 辅助功能 中勾选 desktools 并重启应用".into()
+        "macOS 未授予「模拟按键」权限（辅助功能）：已尝试弹出系统授权面板；若未出现，请到 系统设置 → 隐私与安全性 → 辅助功能 勾选 desktools（之前拒绝过需手动开启）并重启应用；本次注入仍会尝试但可能被系统丢弃".into()
     }
 
     /// 预检系统是否允许监听键盘事件（以预检为准，不弹安全面板）。
@@ -1452,6 +1511,161 @@ mod macos_impl {
     pub(super) fn post_access_ok() -> Option<bool> {
         let api = api().ok()?;
         api.preflight_post.map(|check| unsafe { check() })
+    }
+
+    /// 主动请求「模拟按键」权限（辅助功能）：系统会弹出授权面板并把应用加入列表。
+    /// 仅在预检失败且首次收到远端按键时调用；已拒绝过的应用不会再次弹窗。
+    pub(super) fn request_post_access() {
+        if let Ok(api) = api()
+            && let Some(request) = api.request_post
+        {
+            unsafe {
+                request();
+            }
+        }
+    }
+
+    /* ---- macOS 顶排 F7~F12：按物理键语义注入媒体键 ---- */
+
+    /// Objective-C 运行时 / AppKit 函数集合（构造 NX_SYSDEFINED 媒体键事件）
+    struct MediaApi {
+        ns_event_class: *mut c_void,
+        sel_other_event: *mut c_void,
+        sel_cg_event: *mut c_void,
+        other_event: OtherEventFn,
+        cg_event: NsEventToCgFn,
+        pool_push: AutoreleasePoolPushFn,
+        pool_pop: AutoreleasePoolPopFn,
+    }
+
+    // 仅函数指针与 ObjC 类/选择器地址，跨线程只读使用安全
+    unsafe impl Send for MediaApi {}
+    unsafe impl Sync for MediaApi {}
+
+    fn media_api() -> Result<&'static MediaApi, String> {
+        static MEDIA_API: OnceLock<Result<MediaApi, String>> = OnceLock::new();
+        MEDIA_API
+            .get_or_init(|| {
+                let _appkit = open_framework("/System/Library/Frameworks/AppKit.framework/AppKit")
+                    .ok_or("dlopen AppKit 失败")?;
+                let objc = open_framework("/usr/lib/libobjc.A.dylib")
+                    .ok_or("dlopen libobjc 失败")?;
+                let get_class: GetClassFn = objc_sym(objc, "objc_getClass")?;
+                let sel_register: SelRegisterFn = objc_sym(objc, "sel_registerName")?;
+                let msg_send = dlsym_checked(objc, "objc_msgSend")
+                    .ok_or_else(|| "缺少符号 objc_msgSend".to_string())?;
+                let pool_push: AutoreleasePoolPushFn = objc_sym(objc, "objc_autoreleasePoolPush")?;
+                let pool_pop: AutoreleasePoolPopFn = objc_sym(objc, "objc_autoreleasePoolPop")?;
+                let class_name = CString::new("NSEvent").unwrap();
+                let ns_event_class = unsafe { get_class(class_name.as_ptr()) };
+                if ns_event_class.is_null() {
+                    return Err("未找到 NSEvent 类".into());
+                }
+                let other_sel = CString::new(
+                    "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
+                )
+                .unwrap();
+                let cg_sel = CString::new("CGEvent").unwrap();
+                Ok(MediaApi {
+                    ns_event_class,
+                    sel_other_event: unsafe { sel_register(other_sel.as_ptr()) },
+                    sel_cg_event: unsafe { sel_register(cg_sel.as_ptr()) },
+                    other_event: unsafe { std::mem::transmute::<*mut c_void, OtherEventFn>(msg_send) },
+                    cg_event: unsafe { std::mem::transmute::<*mut c_void, NsEventToCgFn>(msg_send) },
+                    pool_push,
+                    pool_pop,
+                })
+            })
+            .as_ref()
+            .map_err(|err| err.clone())
+    }
+
+    fn objc_sym<T>(handle: *mut c_void, name: &str) -> Result<T, String> {
+        let ptr = dlsym_checked(handle, name).ok_or_else(|| format!("缺少符号 {name}"))?;
+        Ok(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&ptr) })
+    }
+
+    /// 顶排 F7~F12 的媒体功能（与物理键一致；F1~F6 涉及亮度 / 调度中心等，暂不转换）
+    pub(super) fn media_aux_key(key: &str) -> Option<(u32, &'static str)> {
+        Some(match key {
+            "f7" => (NX_KEYTYPE_PREVIOUS, "上一首"),
+            "f8" => (NX_KEYTYPE_PLAY, "播放/暂停"),
+            "f9" => (NX_KEYTYPE_NEXT, "下一首"),
+            "f10" => (NX_KEYTYPE_MUTE, "静音"),
+            "f11" => (NX_KEYTYPE_SOUND_DOWN, "音量减"),
+            "f12" => (NX_KEYTYPE_SOUND_UP, "音量加"),
+            _ => return None,
+        })
+    }
+
+    /// 系统是否勾选「将 F1、F2 等键用作标准功能键」。
+    /// 未设置 / 0 = 顶排默认媒体键（注入时模拟媒体键）；1 = 标准 F 键。
+    /// 30 秒缓存：避免每次按键都起 `defaults` 进程，又能让用户改设置后较快生效。
+    fn fn_keys_standard() -> bool {
+        static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+        let now = Instant::now();
+        if let Some((at, value)) = *CACHE.lock().unwrap()
+            && now.duration_since(at) < Duration::from_secs(30)
+        {
+            return value;
+        }
+        let value = std::process::Command::new("/usr/bin/defaults")
+            .args(["read", "-g", "com.apple.keyboard.fnState"])
+            .output()
+            .ok()
+            .is_some_and(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+            });
+        *CACHE.lock().unwrap() = Some((now, value));
+        value
+    }
+
+    /// 该目标组合是否会按媒体键注入（None = 普通按键；Some(说明) 用于日志）
+    pub(super) fn media_target(combo: &KeyCombo) -> Option<&'static str> {
+        if combo.mask() != 0 || fn_keys_standard() {
+            return None;
+        }
+        media_aux_key(&combo.key).map(|(_, label)| label)
+    }
+
+    /// 投递一对 NX_SYSDEFINED 媒体键事件（data1 = 键类型 + 按下/抬起状态）。
+    /// CGEventPost 无法直接构造该类型，这里经 NSEvent 转换后投递到 HID tap。
+    fn post_media_key(api: &MacApi, aux: u32) -> Result<(), String> {
+        let media = media_api()?;
+        unsafe {
+            let pool = (media.pool_push)();
+            for down in [true, false] {
+                let state: i64 = if down { 0xA } else { 0xB };
+                let data1 = (i64::from(aux) << 16) | (state << 8);
+                let ns_event = (media.other_event)(
+                    media.ns_event_class,
+                    media.sel_other_event,
+                    NS_EVENT_TYPE_SYSTEM_DEFINED,
+                    0.0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    std::ptr::null_mut(),
+                    NX_SUBTYPE_AUX_CONTROL_BUTTONS,
+                    data1,
+                    -1,
+                );
+                if ns_event.is_null() {
+                    (media.pool_pop)(pool);
+                    return Err("创建媒体键事件失败".into());
+                }
+                let event = (media.cg_event)(ns_event, media.sel_cg_event);
+                if event.is_null() {
+                    (media.pool_pop)(pool);
+                    return Err("创建媒体键 CGEvent 失败".into());
+                }
+                (api.event_set_field)(event, CG_FIELD_SOURCE_USER_DATA, CG_SELF_INJECT_MARKER);
+                (api.event_post)(CG_EVENT_TAP_HID, event);
+            }
+            (media.pool_pop)(pool);
+        }
+        Ok(())
     }
 
     /// macOS 虚拟键码（kVK_*，物理键位）
@@ -1752,6 +1966,15 @@ mod macos_impl {
     /// 让 tap 回调跳过，防回环）。
     pub(super) fn inject(combo: &KeyCombo) -> Result<(), String> {
         let api = api()?;
+        // macOS 顶排 F7~F12 默认是媒体键：未按修饰键且系统未切到「标准功能键」时，
+        // 模拟物理媒体键（NX_SYSDEFINED）。否则 Music / QQ 音乐等只监听媒体键的
+        // 应用收不到普通 F 键——表现为「日志显示已注入，但音乐毫无反应」。
+        if combo.mask() == 0
+            && !fn_keys_standard()
+            && let Some((aux, _)) = media_aux_key(&combo.key)
+        {
+            return post_media_key(api, aux);
+        }
         let keycode = keycode_for_key(&combo.key)
             .ok_or_else(|| format!("目标主键「{}」不受支持", combo.key))?;
         // 不在这里用 CGPreflightPostEventAccess 阻断注入：该预检在部分环境会误报
@@ -1872,6 +2095,20 @@ mod tests {
             display_combo(&parse_combo("alt+f1").unwrap(), "macos"),
             "Option+F1"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_media_keys_map_top_row_f7_to_f12() {
+        use super::macos_impl::media_aux_key;
+        assert_eq!(media_aux_key("f7").unwrap().1, "上一首");
+        assert_eq!(media_aux_key("f8").unwrap().1, "播放/暂停");
+        assert_eq!(media_aux_key("f9").unwrap().1, "下一首");
+        assert_eq!(media_aux_key("f10").unwrap().1, "静音");
+        assert_eq!(media_aux_key("f11").unwrap().1, "音量减");
+        assert_eq!(media_aux_key("f12").unwrap().1, "音量加");
+        assert!(media_aux_key("f6").is_none());
+        assert!(media_aux_key("a").is_none());
     }
 
     #[test]
