@@ -208,10 +208,10 @@ pub fn normalize_key_name(raw: &str) -> Option<String> {
     }
     // F1 ~ F12
     if let Some(num) = folded.strip_prefix('f') {
-        if let Ok(n) = num.parse::<u8>() {
-            if (1..=12).contains(&n) {
-                return Some(format!("f{n}"));
-            }
+        if let Ok(n) = num.parse::<u8>()
+            && (1..=12).contains(&n)
+        {
+            return Some(format!("f{n}"));
         }
         return None;
     }
