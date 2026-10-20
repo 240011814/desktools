@@ -1005,6 +1005,33 @@ pub fn inject_combo(combo: &KeyCombo) -> Result<(), String> {
     }
 }
 
+/// macOS 键鼠权限状态（系统设置页提示用；非 macOS supported = false）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeySyncPermissions {
+    pub supported: bool,
+    /// 输入监控（监听本机按键）；None = 当前系统无预检 API
+    pub listen: Option<bool>,
+    /// 辅助功能（注入模拟按键）；None = 当前系统无预检 API
+    pub post: Option<bool>,
+}
+
+/// 查询当前进程的按键同步权限（macOS 专用；预检可能误报，仅用于 UI 提示）
+pub fn key_sync_permissions() -> KeySyncPermissions {
+    #[cfg(target_os = "macos")]
+    {
+        macos_impl::permissions()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        KeySyncPermissions {
+            supported: false,
+            listen: None,
+            post: None,
+        }
+    }
+}
+
 /* ---------------- Windows：WH_KEYBOARD_LL 钩子 + SendInput 注入 ---------------- */
 
 #[cfg(target_os = "windows")]
@@ -1513,6 +1540,22 @@ mod macos_impl {
         api.preflight_post.map(|check| unsafe { check() })
     }
 
+    /// 查询监听 / 注入两类系统权限，供设置页展示可操作的提示。
+    pub(super) fn permissions() -> KeySyncPermissions {
+        let Ok(api) = api() else {
+            return KeySyncPermissions {
+                supported: true,
+                listen: None,
+                post: None,
+            };
+        };
+        KeySyncPermissions {
+            supported: true,
+            listen: api.preflight_listen.map(|check| unsafe { check() }),
+            post: api.preflight_post.map(|check| unsafe { check() }),
+        }
+    }
+
     /// 主动请求「模拟按键」权限（辅助功能）：系统会弹出授权面板并把应用加入列表。
     /// 仅在预检失败且首次收到远端按键时调用；已拒绝过的应用不会再次弹窗。
     pub(super) fn request_post_access() {
@@ -1635,15 +1678,17 @@ mod macos_impl {
         unsafe {
             let pool = (media.pool_push)();
             for down in [true, false] {
-                let state: i64 = if down { 0xA } else { 0xB };
-                let data1 = (i64::from(aux) << 16) | (state << 8);
+                // 状态位同时写入 modifierFlags 与 data1（0xA00 = 按下，0xB00 = 抬起），
+                // 这是系统媒体键事件的真实形态；只写 data1 时部分系统版本会忽略事件。
+                let state: i64 = if down { 0xA00 } else { 0xB00 };
+                let data1 = (i64::from(aux) << 16) | state;
                 let ns_event = (media.other_event)(
                     media.ns_event_class,
                     media.sel_other_event,
                     NS_EVENT_TYPE_SYSTEM_DEFINED,
                     0.0,
                     0.0,
-                    0,
+                    state as u64,
                     0.0,
                     0,
                     std::ptr::null_mut(),

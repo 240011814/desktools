@@ -272,6 +272,46 @@ let keySyncSaveTimer: number | undefined;
 
 const keySyncTopic = computed(() => `keysync/${form.group.trim() || "<group号>"}`);
 
+/* macOS 权限状态：仅用于设置页提示；预检可能误报，所以不阻断开关与注入 */
+interface KeySyncPermissions {
+  supported: boolean;
+  listen: boolean | null;
+  post: boolean | null;
+}
+
+const keySyncPerm = ref<KeySyncPermissions>({ supported: false, listen: null, post: null });
+const keySyncHasEnabledRule = computed(() => rows.value.some((row) => row.enabled));
+const keySyncPostMissing = computed(
+  () => form.keySyncEnabled && keySyncPerm.value.supported && keySyncPerm.value.post === false,
+);
+const keySyncListenMissing = computed(
+  () =>
+    form.keySyncEnabled &&
+    keySyncHasEnabledRule.value &&
+    keySyncPerm.value.supported &&
+    keySyncPerm.value.listen === false,
+);
+
+async function refreshKeySyncPermissions() {
+  if (!form.keySyncEnabled) {
+    keySyncPerm.value = { supported: false, listen: null, post: null };
+    return;
+  }
+  try {
+    keySyncPerm.value = await invoke<KeySyncPermissions>("get_key_sync_permissions");
+  } catch {
+    keySyncPerm.value = { supported: false, listen: null, post: null };
+  }
+}
+
+async function openKeySyncPermission(kind: "listen" | "post") {
+  try {
+    await invoke("open_key_sync_permission_settings", { kind });
+  } catch (e) {
+    keysyncToast.showToast(String(e));
+  }
+}
+
 /** 按当前平台美化组合显示（Windows 用 Win，macOS 用 Cmd/Option） */
 function comboText(combo: KeyCombo): string {
   return combo.key ? displayCombo(combo, osName) : "";
@@ -616,6 +656,7 @@ async function saveKeySync() {
     rowsDirty.value = false;
     keySyncSaved.value = true;
     setTimeout(() => (keySyncSaved.value = false), 4000);
+    void refreshKeySyncPermissions();
     // macOS 缺权限等部分成功场景：后端已回退开关，前端弹提示
     if (result.warning) keysyncToast.showToast(result.warning);
   } catch (e) {
@@ -722,7 +763,7 @@ async function loadLockReport() {
 }
 
 onMounted(() => {
-  loadConfig();
+  void loadConfig().then(refreshKeySyncPermissions);
   loadIntegration();
   loadAutoStart();
   loadLockReport();
@@ -1045,6 +1086,41 @@ onMounted(() => {
         <span class="switch-text">开启按键同步</span>
       </label>
 
+      <div v-if="keySyncPostMissing || keySyncListenMissing" class="keysync-perm">
+        <p v-if="keySyncPostMissing">
+          未授予「辅助功能」权限，模拟按键会被 macOS 丢弃。
+        </p>
+        <p v-if="keySyncListenMissing">
+          未授予「输入监控」权限，本机按键无法被监听。
+        </p>
+        <div class="keysync-perm-actions">
+          <button
+            v-if="keySyncPostMissing"
+            class="ghost"
+            type="button"
+            @click="openKeySyncPermission('post')"
+          >
+            打开辅助功能设置
+          </button>
+          <button
+            v-if="keySyncListenMissing"
+            class="ghost"
+            type="button"
+            @click="openKeySyncPermission('listen')"
+          >
+            打开输入监控设置
+          </button>
+          <button
+            class="ghost"
+            type="button"
+            title="若已授权仍提示，请重启应用；开发构建需移除旧条目后重新添加"
+            @click="refreshKeySyncPermissions"
+          >
+            重新检测
+          </button>
+        </div>
+      </div>
+
       <div v-if="form.keySyncEnabled" class="keysync-rules">
         <div v-for="row in rows" :key="row.id" class="keysync-row" :class="{ off: !row.enabled }">
           <div class="keysync-meta">
@@ -1294,6 +1370,30 @@ onMounted(() => {
 }
 
 /* ---------- 按键同步规则行 ---------- */
+.keysync-perm {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.keysync-perm p {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.keysync-perm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .keysync-rules {
   margin-top: 14px;
   display: flex;

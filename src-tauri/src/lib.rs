@@ -273,6 +273,36 @@ fn set_key_sync(
 }
 
 #[tauri::command]
+fn get_key_sync_permissions() -> key_sync::KeySyncPermissions {
+    key_sync::key_sync_permissions()
+}
+
+/// 打开 macOS 隐私设置对应面板（仅 macOS；kind = listen / post）
+#[tauri::command]
+fn open_key_sync_permission_settings(kind: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pane = match kind.as_str() {
+            "listen" => "Privacy_ListenEvent",
+            "post" => "Privacy_Accessibility",
+            _ => return Err("未知权限类型".into()),
+        };
+        std::process::Command::new("/usr/bin/open")
+            .arg(format!(
+                "x-apple.systempreferences:com.apple.preference.security?{pane}"
+            ))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开系统设置失败：{e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = kind;
+        Err("当前平台无需此权限".into())
+    }
+}
+
+#[tauri::command]
 fn get_history(state: State<HistoryState>) -> Vec<HistoryItem> {
     state.list()
 }
@@ -603,6 +633,8 @@ pub fn run() {
             set_auto_lock,
             set_lock_sync,
             set_key_sync,
+            get_key_sync_permissions,
+            open_key_sync_permission_settings,
             get_history,
             delete_history,
             clear_history,
