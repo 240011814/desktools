@@ -66,6 +66,32 @@ function formatTime(ts: number): string {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** 复制用完整时间（带年份；列表里为省宽度只显示 月-日 时:分:秒） */
+function formatFullTime(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+const copying = ref(false);
+
+/** 一键复制当前筛选下的日志：每行带完整日期 + 级别，便于直接贴 issue / 对话 */
+async function copyLogs() {
+  if (copying.value || !filtered.value.length) return;
+  copying.value = true;
+  const text = filtered.value
+    .map((e) => `${formatFullTime(e.ts)} [${e.level}] ${e.message}`)
+    .join("\n");
+  try {
+    await invoke("copy_to_clipboard", { text });
+    showToast(`已复制 ${filtered.value.length} 条日志`);
+  } catch (e) {
+    showToast(`复制失败：${String(e)}`);
+  } finally {
+    copying.value = false;
+  }
+}
+
 onMounted(async () => {
   await load();
   try {
@@ -95,6 +121,7 @@ onUnmounted(() => {
           <p class="card-sub">共 {{ entries.length }} 条 · 当前显示 {{ filtered.length }} 条</p>
         </div>
         <div class="actions">
+          <button :disabled="!filtered.length || copying" @click="copyLogs">复制日志</button>
           <button :disabled="!entries.length" @click="load">刷新</button>
           <button class="danger" :disabled="!entries.length" @click="confirmClearOpen = true">
             清空日志
