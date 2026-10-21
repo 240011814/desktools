@@ -12,8 +12,13 @@
 //!   息屏型阶段的免密恢复不广播，避免无来源的解锁事件把远端屏幕点亮。
 //! - 远端事件：`lock` → 复用 `auto_lock` 的锁屏链路锁定本机，但受**活跃守卫**约束
 //!   （本机最近 `lockSyncIdleGuardSecs` 秒内有人键鼠输入则跳过；0 = 关闭守卫；探测失败
-//!   fail-open：照常锁屏并记 WARN）；`unlock` → 仅唤醒显示器到锁屏界面（远程无法、
+//!   fail-open：照常锁屏并记 WARN。**合盖豁免**：本机盖子合上 = 人不在的确定信号，
+//!   忽略守卫直接锁定）；`unlock` → 仅唤醒显示器到锁屏界面（远程无法、
 //!   也不应绕过密码真正解锁）。
+//! - 合盖立即锁屏（macOS）：合盖 ≠ 睡眠（外接显示器开启 clamshell 模式时合盖照常运行、
+//!   不锁屏）。轮询 `IOPMrootDomain` 的 `AppleClamshellState`（零权限），检测到「开 → 合」
+//!   跃迁且本机未锁 → 立即锁屏并广播 lock（合盖触发的跃迁绕过息屏型判定直接广播：
+//!   合盖是主动离开信号，不是空闲息屏；广播窗口内跃迁未发生则过期不补发）。
 //! - 防回环：消息带 `deviceId`（自身消息忽略）；应用远端锁屏后进入发布抑制窗口
 //!   （`REMOTE_SUPPRESS_MS`），本机随之发生的同状态变化不再发布，
 //!   避免 A 锁 → B 锁 → B 又发布 → A 再锁 的回环。
@@ -37,6 +42,11 @@ const POLL_MS: u64 = 1_000;
 /// 应用远端锁屏事件后的发布抑制窗口：
 /// 覆盖「监听线程一轮轮询 + 锁屏指令执行」的耗时，防止被动锁屏被当成新事件再发出去
 const REMOTE_SUPPRESS_MS: i64 = 5_000;
+
+/// 合盖触发锁屏的强制广播窗口：
+/// 合盖锁屏执行的耗时 + 监听线程一轮轮询；窗口内的「未锁 → 已锁」跃迁直接广播
+/// （绕过息屏型判定），跃迁没等到就过期丢弃（如锁屏失败、窗口内被远端事件抢先锁定）
+const LID_FORCE_BROADCAST_MS: i64 = 5_000;
 
 /// 构造同步 topic（group 首尾空白容错）
 pub fn topic(group: &str) -> String {
@@ -92,16 +102,19 @@ pub fn parse_remote_message(raw: &str, own_device_id: &str) -> Result<Option<Loc
     Ok(msg.event_kind())
 }
 
-/// 锁屏同步状态：远端事件应用后的发布抑制标记
+/// 锁屏同步状态：远端事件应用后的发布抑制标记 + 合盖锁屏的强制广播标记
 pub struct LockSyncState {
     /// `Some((截止时间, 目标锁屏状态))`：窗口内本机发生的「同状态变化」判定为被动变化，不再发布
     suppress: Mutex<Option<(i64, bool)>>,
+    /// `Some(截止时间)`：合盖触发的本地锁屏，下一次「未锁 → 已锁」跃迁直接广播（绕过息屏型判定）
+    force_until: Mutex<Option<i64>>,
 }
 
 impl Default for LockSyncState {
     fn default() -> Self {
         Self {
             suppress: Mutex::new(None),
+            force_until: Mutex::new(None),
         }
     }
 }
@@ -124,6 +137,25 @@ impl LockSyncState {
                 // 一次性标记：无论是否命中都消费掉（状态不匹配时更不能留到下一次跃迁）
                 *suppress = None;
                 state == locked && now <= until
+            }
+            None => false,
+        }
+    }
+
+    /// 合盖触发锁屏前标记：下一次「未锁 → 已锁」跃迁直接广播（绕过息屏型判定），
+    /// 与 mark_remote_locked 相同的「先标记再执行锁屏」次序
+    fn mark_lid_locked(&self) {
+        *self.force_until.lock().unwrap() = Some(now_ms() + LID_FORCE_BROADCAST_MS);
+    }
+
+    /// 判定并消费强制广播标记：true = 本次「已锁」跃迁由合盖触发，应直接广播
+    /// （窗口过期 / 跃迁状态不匹配都只丢弃标记，不生效——消费语义与 suppress 相同）
+    fn should_force_broadcast_at(&self, locked: bool, now: i64) -> bool {
+        let mut force = self.force_until.lock().unwrap();
+        match *force {
+            Some(until) => {
+                *force = None;
+                locked && now <= until
             }
             None => false,
         }
@@ -163,9 +195,14 @@ impl LockSyncState {
                 }
                 // 活跃守卫：有人正在本机操作时不用被远端事件锁掉，跳过（记 INFO 便于排查）。
                 // 阈值 0 = 关闭守卫；探测失败 fail-open：照常锁屏、失败详情记 WARN。
+                // 合盖豁免：盖子已合上 = 人不在的确定信号，忽略之前设置的活跃守卫时间直接锁定
+                //（覆盖「刚合盖就被远端事件赶在轮询之前」的时间窗，以及本机锁屏失败的兜底）；
+                // 盖子探测失败按「未合」处理，守卫照常生效（fail-open 不豁免）。
                 let threshold = cfg.lock_sync_idle_guard_secs;
                 let idle = input_idle_secs();
-                if guard_blocks(&idle, threshold) {
+                let lid = is_lid_closed();
+                let lid_closed = matches!(lid, Ok(true));
+                if follow_lock_intercepts(guard_blocks(&idle, threshold), lid_closed) {
                     // 这里 idle 必为 Ok（guard_blocks 只在 Ok 分支返回 true）
                     let idle_secs = idle.as_ref().unwrap_or(&0);
                     logger::log(
@@ -183,6 +220,13 @@ impl LockSyncState {
                         app,
                         WARN,
                         format!("锁屏同步：活跃守卫探测失败（{err}），本次照常锁屏"),
+                    );
+                }
+                if lid_closed {
+                    logger::log(
+                        app,
+                        INFO,
+                        "锁屏同步：收到远端锁屏事件，本机盖子已合上，忽略活跃守卫并锁定",
                     );
                 }
                 // 先标记抑制再执行锁屏：监听线程随后观察到的「已锁」跃迁不再对外发布
@@ -222,6 +266,13 @@ pub fn guard_blocks(idle: &Result<u64, String>, threshold_secs: u64) -> bool {
         Ok(idle_secs) => *idle_secs < threshold_secs,
         Err(_) => false, // 探测失败：偏向继续锁
     }
+}
+
+/// 跟随锁屏拦截判定（活跃守卫 + 合盖豁免，纯逻辑，供测试）：
+/// - 守卫命中且盖子未合 → 拦截（有人正在本机操作）
+/// - 盖子已合 → 永不拦截（盖子合上 = 人不在的确定信号，忽略之前设置的活跃守卫时间）
+pub fn follow_lock_intercepts(guard_intercepts: bool, lid_closed: bool) -> bool {
+    guard_intercepts && !lid_closed
 }
 
 /// 本机最近一次键鼠输入距今的空闲秒数（活跃守卫的输入源；探测失败返回 Err）。
@@ -446,6 +497,134 @@ fn windows_is_screen_locked() -> Result<bool, String> {
     }
 }
 
+/* ---------------- 合盖状态探测（macOS） ---------------- */
+
+/// 本机盖子是否处于合上状态（true = 已合盖）：
+/// - macOS：dlopen IOKit 读 `IOPMrootDomain` 的 `AppleClamshellState`
+///   （键存在 = 笔记本；CFBoolean true = 已合上。合盖 ≠ 睡眠，外接显示器
+///   clamshell 模式合盖后系统照常运行，这正是需要该探测的原因）
+/// - 其他平台：不支持（盖子视为未合，守卫照常生效）
+///
+/// 零权限只读查询；桌面 Mac（iMac / Mac mini）无该键 → Err，调用方按未合盖处理。
+pub fn is_lid_closed() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos_is_lid_closed()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台不支持盖子状态检测".into())
+    }
+}
+
+/// macOS：IOKit 名称匹配 `IOPMrootDomain` 后读 `AppleClamshellState` 属性（CFBoolean）。
+/// 注意 `IOServiceGetMatchingService` 会**消耗**传入的匹配字典（不另做 CFRelease）；
+/// service / 键字符串 / 属性值各自 +1，用完逐个释放。与 macos_is_screen_locked 相同的
+/// dlopen/dlsym 模式（每秒轮询期间不能泄漏引用计数）
+#[cfg(target_os = "macos")]
+fn macos_is_lid_closed() -> Result<bool, String> {
+    use std::ffi::{c_char, c_void};
+
+    type IOServiceNameMatchingFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type IOServiceGetMatchingServiceFn = unsafe extern "C" fn(u32, *const c_void) -> u32;
+    type IORegistryEntryCreateCFPropertyFn =
+        unsafe extern "C" fn(u32, *const c_void, *const c_void, u32) -> *const c_void;
+    type IOObjectReleaseFn = unsafe extern "C" fn(u32) -> i32;
+    type StringCreate = unsafe extern "C" fn(*const c_void, *const c_char, u32) -> *const c_void;
+    type GetTypeId = unsafe extern "C" fn(*const c_void) -> usize;
+    type GetTypeIdNoArg = unsafe extern "C" fn() -> usize;
+    type BoolGetValue = unsafe extern "C" fn(*const c_void) -> u8;
+    type Release = unsafe extern "C" fn(*const c_void);
+
+    /// kCFStringEncodingUTF8
+    const UTF8: u32 = 0x0800_0100;
+
+    /// dlopen 的框架句柄，Drop 时 dlclose（每秒轮询期间不能泄漏引用计数）
+    struct Framework(*mut c_void);
+    impl Drop for Framework {
+        fn drop(&mut self) {
+            unsafe { libc::dlclose(self.0) };
+        }
+    }
+
+    let iokit = Framework(
+        auto_lock::open_framework("/System/Library/Frameworks/IOKit.framework/IOKit")
+            .ok_or("dlopen IOKit 失败")?,
+    );
+    let cf = Framework(
+        auto_lock::open_framework(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        )
+        .ok_or("dlopen CoreFoundation 失败")?,
+    );
+
+    unsafe {
+        let name_matching: IOServiceNameMatchingFn = std::mem::transmute(
+            auto_lock::dlsym_checked(iokit.0, "IOServiceNameMatching")
+                .ok_or("缺少 IOServiceNameMatching")?,
+        );
+        let get_matching_service: IOServiceGetMatchingServiceFn = std::mem::transmute(
+            auto_lock::dlsym_checked(iokit.0, "IOServiceGetMatchingService")
+                .ok_or("缺少 IOServiceGetMatchingService")?,
+        );
+        let create_property: IORegistryEntryCreateCFPropertyFn = std::mem::transmute(
+            auto_lock::dlsym_checked(iokit.0, "IORegistryEntryCreateCFProperty")
+                .ok_or("缺少 IORegistryEntryCreateCFProperty")?,
+        );
+        let object_release: IOObjectReleaseFn = std::mem::transmute(
+            auto_lock::dlsym_checked(iokit.0, "IOObjectRelease").ok_or("缺少 IOObjectRelease")?,
+        );
+        let string_create: StringCreate = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFStringCreateWithCString")
+                .ok_or("缺少 CFStringCreateWithCString")?,
+        );
+        let get_type_id: GetTypeId = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFGetTypeID").ok_or("缺少 CFGetTypeID")?,
+        );
+        let bool_type_id: GetTypeIdNoArg = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFBooleanGetTypeID")
+                .ok_or("缺少 CFBooleanGetTypeID")?,
+        );
+        let bool_get: BoolGetValue = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFBooleanGetValue").ok_or("缺少 CFBooleanGetValue")?,
+        );
+        let release: Release = std::mem::transmute(
+            auto_lock::dlsym_checked(cf.0, "CFRelease").ok_or("缺少 CFRelease")?,
+        );
+
+        let dict = name_matching(c"IOPMrootDomain".as_ptr());
+        if dict.is_null() {
+            return Err("IOServiceNameMatching 失败".into());
+        }
+        // kIOMainPortDefault 为 0；匹配字典按文档被该调用消耗，无须再 CFRelease
+        let service = get_matching_service(0, dict);
+        if service == 0 {
+            return Err("未找到 IOPMrootDomain".into());
+        }
+        let key = string_create(std::ptr::null(), c"AppleClamshellState".as_ptr(), UTF8);
+        if key.is_null() {
+            let _ = object_release(service);
+            return Err("构造 AppleClamshellState 键失败".into());
+        }
+        let value = create_property(service, key, std::ptr::null(), 0);
+        let result = if value.is_null() {
+            // 键不存在 = 桌面 Mac（iMac / Mac mini），没有盖子
+            Err("IOPMrootDomain 缺少 AppleClamshellState 键（非笔记本？）".into())
+        } else if get_type_id(value) == bool_type_id() {
+            // CFBoolean true = 已合盖
+            Ok(bool_get(value) != 0)
+        } else {
+            Err("AppleClamshellState 值类型异常".into())
+        };
+        if !value.is_null() {
+            release(value);
+        }
+        release(key);
+        let _ = object_release(service);
+        result
+    }
+}
+
 /// Windows：广播「打开显示器」命令 + 短暂声明显示需求再释放（部分系统上单用其一无效）
 #[cfg(target_os = "windows")]
 fn windows_wake_display() -> Result<String, String> {
@@ -568,6 +747,7 @@ pub fn is_active_display_lock(display_active: &Result<bool, String>) -> bool {
 /// 监听本机锁屏状态（轮询），状态跃迁时按真锁屏判定发布到 locksync/<group>：
 /// - 启动 / 开关刚开启：先建立基准状态，不发布
 /// - 应用远端事件引起的被动变化：由抑制窗口拦截，不发布
+/// - 合盖触发的锁屏：锁定跃迁直接广播 lock（绕过息屏型判定，见 LockSyncState 的 force 标记）
 /// - 仅「锁定瞬间显示器仍点亮」的立即型真锁屏发布 lock，息屏型锁定不发布；
 ///   显示器状态探测失败 fail-open 视为真锁屏发布
 /// - 只有此前广播过 lock 的会话随后才广播 unlock（息屏型阶段免密恢复不广播）
@@ -620,9 +800,12 @@ pub fn spawn_watcher(app: AppHandle) {
                     Some(prev) if prev == locked => {}
                     Some(_) => {
                         baseline = Some(locked);
-                        // 无论锁定/解锁跃迁都消费抑制标记（保持一次性语义，
-                        // 防止远端锁屏窗口内被快速解锁后标记滞留在下一次跃迁）
+                        // 无论锁定/解锁跃迁都消费抑制与强制广播标记（保持一次性语义，
+                        // 防止远端锁屏窗口/合盖广播窗口内被快速解锁后标记滞留在下一次跃迁）
                         let suppressed = app.state::<LockSyncState>().should_suppress(locked);
+                        let forced = app
+                            .state::<LockSyncState>()
+                            .should_force_broadcast_at(locked, now_ms());
                         if locked {
                             if suppressed {
                                 announced = false;
@@ -631,6 +814,20 @@ pub fn spawn_watcher(app: AppHandle) {
                                     INFO,
                                     "锁屏同步：本机状态变化由远端事件触发，跳过发布",
                                 );
+                            } else if forced {
+                                // 合盖触发的锁屏：直接广播（绕过息屏型判定——盖子合上
+                                // 是人离开的确定信号，不是空闲息屏）
+                                if let Some(client) = &client {
+                                    announced = true;
+                                    publish_state(&app, client, locked);
+                                } else {
+                                    announced = false;
+                                    logger::log(
+                                        &app,
+                                        INFO,
+                                        "锁屏同步：MQTT 未连接，本次状态变化未发布",
+                                    );
+                                }
                             } else if !is_active_display_lock(&display_is_active()) {
                                 // 锁定与显示器熄灭同刻：息屏型阶段一（密码延迟未到期），不广播
                                 announced = false;
@@ -665,6 +862,95 @@ pub fn spawn_watcher(app: AppHandle) {
                             announced = false;
                             logger::log(&app, INFO, "锁屏同步：MQTT 未连接，本次状态变化未发布");
                         }
+                    }
+                }
+            }
+        });
+}
+
+/// 监听本机盖子状态（macOS 轮询），检测到「开 → 合」跃迁且本机未锁 → 立即锁屏：
+/// - 合盖 ≠ 睡眠：外接显示器开启 clamshell 模式时合盖后系统照常运行、缺省不锁屏，
+///   这里补上确定性锁屏（对外广播由 spawn_watcher 的锁定跃迁链路接管）
+/// - 门禁：广播 / 跟随任一开启才轮询；两者都关时不探测、重置基准
+/// - 已处于锁屏状态时合盖不重复锁（例如手动锁定后才合盖）
+/// - 仅跃迁触发：合盖后锁定失败不自动重试（盖子仍合着时每秒追踪重锁会与
+///   外接显示器下用户的主动解锁打架），失败记得 ERROR 便于排查
+#[cfg(desktop)]
+pub fn spawn_lid_watcher(app: AppHandle) {
+    let _ = std::thread::Builder::new()
+        .name("lock-sync-lid-watcher".into())
+        .spawn(move || {
+            // Some(已合盖)；None = 基准未建立（启动 / 开关刚开启 / 非 macOS 或桌面 Mac）
+            let mut baseline_closed: Option<bool> = None;
+            let mut last_error: Option<String> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+
+                let enabled = {
+                    let sync = app.state::<crate::mqtt::SyncState>();
+                    let cfg = sync.config.lock().unwrap();
+                    cfg.lock_sync_publish || cfg.lock_sync_follow
+                };
+                if !enabled {
+                    baseline_closed = None;
+                    last_error = None;
+                    continue;
+                }
+
+                #[cfg(target_os = "macos")]
+                let probe = is_lid_closed();
+                #[cfg(not(target_os = "macos"))]
+                let probe: Result<bool, String> = Err("当前平台不支持盖子状态检测".into());
+
+                let Some(closed) = (match probe {
+                    Ok(closed) => {
+                        if last_error.is_some() {
+                            last_error = None;
+                            logger::log(&app, INFO, "锁屏同步：盖子状态探测已恢复");
+                        }
+                        Some(closed)
+                    }
+                    Err(err) => {
+                        // 仅原因变化时记 WARN，避免每秒刷日志；
+                        // 非 macOS / 桌面 Mac 的长期 Err 属预期，走 same-reason 去重后静默
+                        if last_error.as_deref() != Some(err.as_str()) {
+                            logger::log(&app, WARN, format!("锁屏同步：盖子状态探测失败：{err}"));
+                            last_error = Some(err);
+                        }
+                        None
+                    }
+                }) else {
+                    continue;
+                };
+
+                match baseline_closed {
+                    None => baseline_closed = Some(closed),
+                    Some(prev) if prev == closed => {}
+                    Some(_) => {
+                        baseline_closed = Some(closed);
+                        if closed {
+                            // 开 → 合：先查本机锁屏状态，未锁才执行锁屏
+                            if is_screen_locked().unwrap_or(false) {
+                                logger::log(&app, INFO, "锁屏同步：检测到合盖，本机已处于锁屏状态");
+                                continue;
+                            }
+                            // 先标记强制广播再锁屏，监听线程随后观察到的「已锁」跃迁直接广播
+                            app.state::<LockSyncState>().mark_lid_locked();
+                            logger::log(&app, INFO, "锁屏同步：检测到合盖，立即锁屏");
+                            match auto_lock::lock_screen(&app) {
+                                Ok(method) => logger::log(
+                                    &app,
+                                    INFO,
+                                    format!("锁屏同步：合盖锁屏完成（{method}）"),
+                                ),
+                                Err(err) => logger::log(
+                                    &app,
+                                    ERROR,
+                                    format!("锁屏同步：合盖锁屏失败：{err}"),
+                                ),
+                            }
+                        }
+                        // 合 → 开：无须处理
                     }
                 }
             }
@@ -782,6 +1068,50 @@ mod tests {
         assert!(!guard_blocks(&broken, 300));
     }
 
+    #[test]
+    fn lid_close_bypasses_active_guard() {
+        // 盖子合上 = 无人使用：守卫命中也放行（忽略之前设置的活跃守卫时间）
+        assert!(!follow_lock_intercepts(true, true));
+        // 盖子未合：守卫保持原判定
+        assert!(follow_lock_intercepts(true, false));
+        assert!(!follow_lock_intercepts(false, false));
+        assert!(!follow_lock_intercepts(false, true));
+    }
+
+    #[test]
+    fn lid_force_broadcast_is_one_shot_within_window() {
+        let state = LockSyncState::default();
+        state
+            .force_until
+            .lock()
+            .unwrap()
+            .replace(1_000 + LID_FORCE_BROADCAST_MS);
+        // 窗口边界内 + 「已锁」跃迁 → 强制广播
+        assert!(state.should_force_broadcast_at(true, 1_000 + LID_FORCE_BROADCAST_MS));
+        // 一次性：再次判定不再生效
+        assert!(!state.should_force_broadcast_at(true, 1_000 + LID_FORCE_BROADCAST_MS));
+    }
+
+    #[test]
+    fn lid_force_broadcast_expires_and_skips_unlock_transition() {
+        let state = LockSyncState::default();
+        state
+            .force_until
+            .lock()
+            .unwrap()
+            .replace(2_000 + LID_FORCE_BROADCAST_MS);
+        // 超窗 → 不能把迟到的跃迁当成合盖事件广播
+        assert!(!state.should_force_broadcast_at(true, 2_000 + LID_FORCE_BROADCAST_MS + 1));
+        // 必须已锁（未锁 → 已锁）才生效：解锁跃迁不生效且标记被消费（一次性语义）
+        state
+            .force_until
+            .lock()
+            .unwrap()
+            .replace(2_000 + LID_FORCE_BROADCAST_MS);
+        assert!(!state.should_force_broadcast_at(false, 2_000));
+        assert!(!state.should_force_broadcast_at(true, 2_000));
+    }
+
     /// 真实探测一次本机输入空闲时长：保证 dlopen/dlsym/FFI 链路不 panic（不校验具体值）
     #[test]
     fn real_idle_probe_does_not_panic() {
@@ -792,6 +1122,12 @@ mod tests {
     #[test]
     fn real_detection_does_not_panic() {
         let _ = is_screen_locked();
+    }
+
+    /// 真实探测一次本机盖子状态：保证 IOKit 名称匹配 + 属性读取链路不 panic（不校验合未合）
+    #[test]
+    fn real_lid_probe_does_not_panic() {
+        let _ = is_lid_closed();
     }
 
     #[test]

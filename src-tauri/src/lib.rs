@@ -758,6 +758,10 @@ pub fn run() {
             #[cfg(desktop)]
             lock_sync::spawn_watcher(app.handle().clone());
 
+            // 监听本机合盖状态，合盖且未锁时立即锁屏（macOS，锁屏同步开启时生效）
+            #[cfg(desktop)]
+            lock_sync::spawn_lid_watcher(app.handle().clone());
+
             // 开机自启：按 config.json 的 autoStart 意图与系统实际状态对齐（仅打包构建管理，
             // debug 构建跳过，避免把自启条目指向 target/debug 二进制）
             autostart::sync_on_startup(app.handle());
