@@ -24,6 +24,9 @@
 //! - 合盖立即锁屏：检测到「开 → 合」跃迁且本机未锁 → 立即锁屏
 //!   （合盖 ≠ 睡眠：外接显示器 clamshell 模式合盖照常运行，缺省不锁屏；对外广播由
 //!   既有锁定跃迁链路接管，盖子合着时绕过息屏型判定直接广播）。
+//! - 合盖补发：合盖时本机已锁（如息屏型从未广播过的会话、或手动锁定后延迟合盖）→
+//!   补发一条 lock（盖子此刻合着，`lid` 必为 true），接收端凭合盖标记豁免活跃守卫
+//!   跟随锁定；已锁接收端幂等；补发登记为已广播，其后解锁照常广播 unlock。
 //! - 防回环：消息带 `deviceId`（自身消息忽略）；应用远端锁屏后进入发布抑制窗口
 //!   （`REMOTE_SUPPRESS_MS`），本机随之发生的同状态变化不再发布，
 //!   避免 A 锁 → B 锁 → B 又发布 → A 再锁 的回环。
@@ -121,21 +124,35 @@ pub fn parse_remote_message(raw: &str, own_device_id: &str) -> Result<Option<Rem
     }))
 }
 
-/// 锁屏同步状态：远端事件应用后的发布抑制标记
+/// 锁屏同步状态：远端事件应用后的发布抑制标记 + 广播端「lock 是否已发布」共享标记
 pub struct LockSyncState {
     /// `Some((截止时间, 目标锁屏状态))`：窗口内本机发生的「同状态变化」判定为被动变化，不再发布
     suppress: Mutex<Option<(i64, bool)>>,
+    /// 本机当前已锁会话的 lock 是否对外广播过：决定其 unlock 是否跟随广播（解锁对称），
+    /// 也登记合盖补发。锁屏状态 watcher 与盖子 watcher 两个线程都要读写，故放共享状态
+    lock_announced: Mutex<bool>,
 }
 
 impl Default for LockSyncState {
     fn default() -> Self {
         Self {
             suppress: Mutex::new(None),
+            lock_announced: Mutex::new(false),
         }
     }
 }
 
 impl LockSyncState {
+    /// 当前已锁会话的 lock 是否已对外广播（锁定跃迁发布或合盖补发时置位，解锁跃迁清除）
+    fn lock_announced(&self) -> bool {
+        *self.lock_announced.lock().unwrap()
+    }
+
+    /// 登记 / 清除「lock 已广播」标记（原锁定跃迁 watcher 内局部 announced 的共享化）
+    fn set_lock_announced(&self, announced: bool) {
+        *self.lock_announced.lock().unwrap() = announced;
+    }
+
     /// 应用远端锁屏事件后标记：抑制本机随之发生的「已锁」变化被再次发布
     fn mark_remote_locked(&self) {
         *self.suppress.lock().unwrap() = Some((now_ms() + REMOTE_SUPPRESS_MS, true));
@@ -775,6 +792,7 @@ pub fn should_broadcast_lock(display_active: &Result<bool, String>, lid_closed: 
 /// - 启动 / 开关刚开启：先建立基准状态，不发布
 /// - 应用远端事件引起的被动变化：由抑制窗口拦截，不发布
 /// - 合盖触发的锁屏 / 盖子合着的锁定跃迁：广播 lock（绕过息屏型判定，见 should_broadcast_lock）
+/// - 合盖时本机已锁：补发一次带合盖标记的 lock（「人离开」信号兜底，见 spawn_lid_watcher）
 /// - 仅「锁定瞬间显示器仍点亮」的立即型真锁屏发布 lock，息屏型锁定不发布；
 ///   显示器状态探测失败 fail-open 视为真锁屏发布
 /// - 只有此前广播过 lock 的会话随后才广播 unlock（息屏型阶段免密恢复不广播）
@@ -786,8 +804,6 @@ pub fn spawn_watcher(app: AppHandle) {
         .spawn(move || {
             let mut baseline: Option<bool> = None;
             let mut last_error: Option<String> = None;
-            // 本次锁定会话是否对外广播过 lock：决定其 unlock 是否跟随广播
-            let mut announced = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
 
@@ -796,10 +812,11 @@ pub fn spawn_watcher(app: AppHandle) {
                     let cfg = sync.config.lock().unwrap();
                     (cfg.lock_sync_publish, cfg.group.clone(), sync.client())
                 };
+                let lock_state = app.state::<LockSyncState>();
                 if !publish || group.trim().is_empty() {
                     // 「广播」关闭 / 未配置：清除基准，下次开启时重新建立，不补发历史状态
                     baseline = None;
-                    announced = false;
+                    lock_state.set_lock_announced(false);
                     continue;
                 }
 
@@ -829,12 +846,12 @@ pub fn spawn_watcher(app: AppHandle) {
                         baseline = Some(locked);
                         // 无论锁定/解锁跃迁都消费抑制标记（保持一次性语义，
                         // 防止远端锁屏窗口内被快速解锁后标记滞留在下一次跃迁）
-                        let suppressed = app.state::<LockSyncState>().should_suppress(locked);
+                        let suppressed = lock_state.should_suppress(locked);
                         if locked {
                             // 广播端盖子状态：合着 → 息屏型锁定也广播（见 should_broadcast_lock）
                             let lid_closed = matches!(is_lid_closed(), Ok(true));
                             if suppressed {
-                                announced = false;
+                                lock_state.set_lock_announced(false);
                                 logger::log(
                                     &app,
                                     INFO,
@@ -842,17 +859,17 @@ pub fn spawn_watcher(app: AppHandle) {
                                 );
                             } else if !should_broadcast_lock(&display_is_active(), lid_closed) {
                                 // 锁定与显示器熄灭同刻：息屏型阶段一（密码延迟未到期），不广播
-                                announced = false;
+                                lock_state.set_lock_announced(false);
                                 logger::log(
                                     &app,
                                     INFO,
                                     "锁屏同步：息屏型锁定（显示器同步熄灭），不广播",
                                 );
                             } else if let Some(client) = &client {
-                                announced = true;
+                                lock_state.set_lock_announced(true);
                                 publish_state(&app, client, locked);
                             } else {
-                                announced = false;
+                                lock_state.set_lock_announced(false);
                                 logger::log(
                                     &app,
                                     INFO,
@@ -860,8 +877,8 @@ pub fn spawn_watcher(app: AppHandle) {
                                 );
                             }
                         } else if let Some(client) = &client {
-                            if announced {
-                                announced = false;
+                            if lock_state.lock_announced() {
+                                lock_state.set_lock_announced(false);
                                 publish_state(&app, client, locked);
                             } else {
                                 logger::log(
@@ -871,7 +888,7 @@ pub fn spawn_watcher(app: AppHandle) {
                                 );
                             }
                         } else {
-                            announced = false;
+                            lock_state.set_lock_announced(false);
                             logger::log(&app, INFO, "锁屏同步：MQTT 未连接，本次状态变化未发布");
                         }
                     }
@@ -887,7 +904,9 @@ pub fn spawn_watcher(app: AppHandle) {
 /// - 状态源：macOS 每秒读 AppleClamshellState；Windows 不做盖子探测
 ///   （长期 Err，走去重后静默，仅消费远端消息里的发送端合盖标记）
 /// - 门禁：广播 / 跟随任一开启才处理；两者都关时不处理、重置基准
-/// - 已处于锁屏状态时合盖不重复锁（例如手动锁定后才合盖）
+/// - 已处于锁屏状态时合盖不重复锁（例如手动锁定后才合盖），但补发一条带合盖标记的
+///   lock：锁定跃迁早已过去，未广播过 lock 的息屏型会话、以及手动锁定消息（lid=false）
+///   曾被接收端活跃守卫跳过的设备，都靠这条补发跟锁；已锁接收端幂等，只记一行日志
 /// - 仅跃迁触发：合盖后锁定失败不自动重试（盖子仍合着时每秒追踪重锁会与
 ///   外接显示器下用户的主动解锁打架），失败记得 ERROR 便于排查
 #[cfg(desktop)]
@@ -943,6 +962,34 @@ pub fn spawn_lid_watcher(app: AppHandle) {
                             // 开 → 合：先查本机锁屏状态，未锁才执行锁屏
                             if is_screen_locked().unwrap_or(false) {
                                 logger::log(&app, INFO, "锁屏同步：检测到合盖，本机已处于锁屏状态");
+                                // 合盖 = 人离开的确定信号：本机不重复锁屏，但要把合盖补发给全组——
+                                // 锁定跃迁早已过去，若当前会话的 lock 从未广播（息屏型不广播）、
+                                // 或广播的消息 lid=false 而被接收端活跃守卫跳过（如手动锁屏后
+                                // 延迟合盖），这条 lid=true 的 lock 是它们跟随锁定的机会
+                                // （接收端凭合盖标记豁免守卫；已锁定的接收端幂等，只记日志）
+                                let (publish, group, client) = {
+                                    let sync = app.state::<crate::mqtt::SyncState>();
+                                    let cfg = sync.config.lock().unwrap();
+                                    (cfg.lock_sync_publish, cfg.group.clone(), sync.client())
+                                };
+                                if publish && !group.trim().is_empty() {
+                                    match client {
+                                        Some(client) => {
+                                            logger::log(
+                                                &app,
+                                                INFO,
+                                                "锁屏同步：合盖时本机已锁，补发带合盖标记的 lock",
+                                            );
+                                            app.state::<LockSyncState>().set_lock_announced(true);
+                                            publish_state(&app, &client, true);
+                                        }
+                                        None => logger::log(
+                                            &app,
+                                            INFO,
+                                            "锁屏同步：MQTT 未连接，本次合盖未补发",
+                                        ),
+                                    }
+                                }
                                 continue;
                             }
                             // 无须主动标记广播：锁定跃迁由监听线程发布时按盖子状态
